@@ -1,0 +1,277 @@
+@import "@fontsource-variable/inter-tight";
+@import "@fontsource-variable/jetbrains-mono";
+@import "tailwindcss";
+
+/* ============================================================================
+   SENTRY design tokens — the single source of visual truth.
+   Two operating modes on one semantic token set:
+     INTEL DARK (default) — graphite command environment
+     DAYLIGHT OPS         — paper/graphite inverse, same discipline
+   Runtime-switchable via :root[data-theme]. Radius 0–2px everywhere.
+   ========================================================================== */
+
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* surfaces — one continuous machined material, stepped by luminance */
+  --sv-bg: #0b0d0e;
+  --sv-raise: #0e1112;
+  --sv-raise2: #121516;
+  --sv-raise3: #171b1d;
+
+  /* structure */
+  --sv-line: rgb(255 255 255 / 0.07);
+  --sv-line-strong: rgb(255 255 255 / 0.13);
+  --sv-line-hover: rgb(255 255 255 / 0.25);
+  --sv-grid: rgb(255 255 255 / 0.04);
+
+  /* text */
+  --sv-text: #e8eaeb;
+  --sv-dim: #8a9096;
+  --sv-faint: #565c61;
+
+  /* system-state colors — every color is a meaning */
+  --sv-accent: #3b7cff;
+  --sv-accent2: #9dc0ff; /* readable accent for text on tinted fields */
+  --sv-accent-soft: rgb(59 124 255 / 0.14);
+  --sv-crosshair: rgb(59 124 255 / 0.4);
+  --sv-pos: #3fae72;
+  --sv-pos2: #7fd6a6;
+  --sv-neg: #d9524b;
+  --sv-neg2: #f0958f;
+  --sv-warn: #d9a544;
+  --sv-warn2: #e8c17a;
+
+  --sv-row-hover: rgb(255 255 255 / 0.03);
+  --sv-selection: rgb(59 124 255 / 0.28);
+  --sv-scrollbar: #24292c;
+  --sv-hist: rgb(138 144 150 / 0.35);
+  --sv-flash-up: #7be3a9;
+  --sv-flash-down: #ff8a80;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --sv-bg: #eef0f1;
+  --sv-raise: #f5f6f7;
+  --sv-raise2: #fbfcfc;
+  --sv-raise3: #e1e5e7;
+
+  --sv-line: rgb(15 23 30 / 0.09);
+  --sv-line-strong: rgb(15 23 30 / 0.17);
+  --sv-line-hover: rgb(15 23 30 / 0.32);
+  --sv-grid: rgb(15 23 30 / 0.05);
+
+  --sv-text: #16191c;
+  --sv-dim: #5a6167;
+  --sv-faint: #9aa1a7;
+
+  --sv-accent: #2158d0;
+  --sv-accent2: #1c4bb8;
+  --sv-accent-soft: rgb(33 88 208 / 0.1);
+  --sv-crosshair: rgb(33 88 208 / 0.45);
+  --sv-pos: #1d7d4d;
+  --sv-pos2: #14603b;
+  --sv-neg: #bf3a32;
+  --sv-neg2: #9c2b24;
+  --sv-warn: #a4741c;
+  --sv-warn2: #7d5a10;
+
+  --sv-row-hover: rgb(15 23 30 / 0.045);
+  --sv-selection: rgb(33 88 208 / 0.2);
+  --sv-scrollbar: #c3c9cd;
+  --sv-hist: rgb(90 97 103 / 0.35);
+  --sv-flash-up: #0f8a50;
+  --sv-flash-down: #cc3e35;
+}
+
+@theme inline {
+  --color-*: initial;
+
+  --color-bg: var(--sv-bg);
+  --color-raise: var(--sv-raise);
+  --color-raise2: var(--sv-raise2);
+  --color-raise3: var(--sv-raise3);
+
+  --color-line: var(--sv-line);
+  --color-line-strong: var(--sv-line-strong);
+  --color-line-hover: var(--sv-line-hover);
+
+  --color-text: var(--sv-text);
+  --color-dim: var(--sv-dim);
+  --color-faint: var(--sv-faint);
+
+  --color-accent: var(--sv-accent);
+  --color-accent2: var(--sv-accent2);
+  --color-pos: var(--sv-pos);
+  --color-pos2: var(--sv-pos2);
+  --color-neg: var(--sv-neg);
+  --color-neg2: var(--sv-neg2);
+  --color-warn: var(--sv-warn);
+  --color-warn2: var(--sv-warn2);
+
+  --color-white: #ffffff;
+
+  --font-sans: "Inter Tight Variable", "Inter Tight", "Helvetica Neue", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "SF Mono", monospace;
+
+  --radius-*: initial;
+  --radius-px: 1px;
+
+  --animate-scan: scan 1.4s linear infinite;
+  --animate-blip: blip 1.8s ease-out infinite;
+
+  @keyframes scan {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(400%);
+    }
+  }
+  @keyframes blip {
+    0% {
+      opacity: 1;
+    }
+    55% {
+      opacity: 0.25;
+    }
+    100% {
+      opacity: 1;
+    }
+  }
+}
+
+@layer base {
+  html {
+    background: var(--sv-bg);
+  }
+  body {
+    @apply bg-bg text-text font-sans antialiased;
+    font-size: 13px;
+    letter-spacing: -0.006em;
+  }
+  ::selection {
+    background: var(--sv-selection);
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--sv-scrollbar) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--sv-scrollbar);
+    border: 2px solid var(--sv-bg);
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+  }
+  /* numbers align. always. */
+  td,
+  th {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@utility label {
+  /* uppercase technical field label */
+  font-size: 10px;
+  font-weight: 550;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sv-dim);
+}
+
+@utility label-faint {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--sv-faint);
+}
+
+@utility mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+@utility panel {
+  background: var(--sv-raise);
+  border: 1px solid var(--sv-line);
+}
+
+@utility hairline-b {
+  border-bottom: 1px solid var(--sv-line);
+}
+@utility hairline-t {
+  border-top: 1px solid var(--sv-line);
+}
+@utility hairline-r {
+  border-right: 1px solid var(--sv-line);
+}
+@utility hairline-l {
+  border-left: 1px solid var(--sv-line);
+}
+
+@utility row-hover {
+  transition: background-color 120ms linear;
+  &:hover {
+    background: var(--sv-row-hover);
+  }
+}
+
+@utility focus-outline {
+  outline: none;
+  &:focus-visible {
+    outline: 1px solid var(--sv-accent);
+    outline-offset: -1px;
+  }
+}
+
+/* thin scanning line for loading surfaces */
+@utility scanline {
+  position: relative;
+  overflow: hidden;
+  &::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: 25%;
+    background: linear-gradient(90deg, transparent, var(--sv-accent-soft), transparent);
+    animation: var(--animate-scan);
+  }
+}
+
+/* live value flash: brief luminance lift, no layout shift */
+@utility val-flash-up {
+  animation: val-up 800ms ease-out 1;
+}
+@utility val-flash-down {
+  animation: val-down 800ms ease-out 1;
+}
+@keyframes val-up {
+  0% {
+    color: var(--sv-flash-up);
+  }
+  100% {
+    color: inherit;
+  }
+}
+@keyframes val-down {
+  0% {
+    color: var(--sv-flash-down);
+  }
+  100% {
+    color: inherit;
+  }
+}
