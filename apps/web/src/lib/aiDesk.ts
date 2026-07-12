@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useAccount, useReadContract } from "wagmi";
+import { useAccount, useReadContracts } from "wagmi";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import Anthropic from "@anthropic-ai/sdk";
@@ -24,7 +24,8 @@ import { useTicket } from "../components/market/ticket";
 import { useOrderLog } from "./trading/orderLog";
 import { useLiveRef, cryptoAlignment, type RefRow } from "./liveRef";
 import { useSmartFlow, type SmartBuy } from "./smartFlow";
-import { USDC, ERC20_ABI } from "./trading/constants";
+import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
+import { cachedDepositWallet } from "./trading/v2client";
 
 /**
  * AI OPERATIONS DESK — statistical engine v2.
@@ -937,17 +938,24 @@ export function useAiDeskEngine() {
   const cryptoRows = useLiveRef((s) => s.rows);
   const startSmartFlow = useSmartFlow((s) => s.start);
   const smartBuys = useSmartFlow((s) => s.buys);
-  // LIVE bankroll is the wallet's REAL Polygon USDC.e — the desk sizes off
-  // actual money, not a config number
+  // LIVE bankroll is REAL on-chain money — CLOB v2 executes from the
+  // Polymarket Deposit Wallet, so once it's linked we read ITS balances
+  // (USDC.e + pUSD, the v2 collateral) instead of the EOA's
   const { address: liveAddress } = useAccount();
-  const { data: liveUsdcRaw } = useReadContract({
-    address: USDC,
-    abi: ERC20_ABI,
-    functionName: "balanceOf",
-    args: [liveAddress ?? "0x0000000000000000000000000000000000000000"],
-    query: { enabled: config.executionMode === "LIVE" && !!liveAddress, refetchInterval: 15_000 },
+  const liveTarget = liveAddress ? (cachedDepositWallet(liveAddress) ?? liveAddress) : undefined;
+  const { data: liveBalRaw } = useReadContracts({
+    contracts: liveTarget
+      ? [
+          { address: USDC, abi: ERC20_ABI, functionName: "balanceOf", args: [liveTarget] },
+          { address: PUSD, abi: ERC20_ABI, functionName: "balanceOf", args: [liveTarget] },
+        ]
+      : [],
+    query: { enabled: config.executionMode === "LIVE" && !!liveTarget, refetchInterval: 15_000 },
   });
-  const liveUsdc = liveUsdcRaw !== undefined ? Number(liveUsdcRaw as bigint) / 1e6 : null;
+  const liveUsdc =
+    liveBalRaw && (liveBalRaw[0]?.result !== undefined || liveBalRaw[1]?.result !== undefined)
+      ? Number(((liveBalRaw[0]?.result as bigint | undefined) ?? 0n) + ((liveBalRaw[1]?.result as bigint | undefined) ?? 0n)) / 1e6
+      : null;
 
   useEffect(() => {
     startLiveRef();

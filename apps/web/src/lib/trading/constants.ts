@@ -3,6 +3,7 @@
 export const CHAIN_ID = 137;
 
 export const USDC = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" as const; // USDC.e (6 decimals)
+export const PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB" as const; // pUSD — CLOB v2 native collateral (6 decimals)
 export const CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045" as const; // Conditional Tokens
 
 export const CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E" as const;

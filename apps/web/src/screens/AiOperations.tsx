@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { useAccount, useSwitchChain } from "wagmi";
+import { useAccount, useSwitchChain, useWalletClient, useReadContracts, useWriteContract } from "wagmi";
+import { erc20Abi } from "viem";
 import { polygon } from "wagmi/chains";
 import { Bot, Power, RotateCcw, FlaskConical } from "lucide-react";
 import { fmt, fetchOrderBook, bookStats, estimateSell, fetchMarketBySlug } from "@sentry-app/polymarket";
@@ -12,6 +13,8 @@ import { useLiveRef } from "../lib/liveRef";
 import { useSmartFlow } from "../lib/smartFlow";
 import { useNotifications } from "../lib/alerts";
 import { useProvision } from "../lib/trading/provision";
+import { cachedDepositWallet, getV2Client } from "../lib/trading/v2client";
+import { USDC, PUSD } from "../lib/trading/constants";
 import {
   useAiDesk,
   paperEquity,
@@ -64,6 +67,47 @@ function Desk() {
   const notify = useNotifications((s) => s.push);
   const eliteOps = useSmartFlow((s) => s.elite);
   const prov = useProvision();
+  const { data: walletClient } = useWalletClient();
+  const { writeContract: depositWrite, isPending: depositPending } = useWriteContract();
+  const [linking, setLinking] = useState(false);
+  // CLOB v2 executes from the Polymarket Deposit Wallet, not the EOA
+  const { address } = useAccount();
+  const depositWallet = address ? cachedDepositWallet(address) : null;
+  const twReads = useReadContracts({
+    contracts: depositWallet
+      ? [
+          { address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
+          { address: PUSD, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
+        ]
+      : [],
+    query: { enabled: !!depositWallet, refetchInterval: 15_000 },
+  });
+  const tradingBal = twReads.data
+    ? Number(((twReads.data[0]?.result as bigint | undefined) ?? 0n) + ((twReads.data[1]?.result as bigint | undefined) ?? 0n)) / 1e6
+    : null;
+
+  const linkTradingWallet = async () => {
+    if (!walletClient || !address) return;
+    setLinking(true);
+    try {
+      await getV2Client(walletClient, address);
+      notify({ kind: "SYSTEM", title: "TRADING WALLET LINKED", body: "Deposit wallet derived — fund it to trade.", href: "/ai" });
+    } catch (e) {
+      notify({ kind: "SYSTEM", title: "TRADING WALLET LINK FAILED", body: e instanceof Error ? e.message.slice(0, 100) : "unknown", href: "/ai" });
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  const depositToTrading = () => {
+    if (!depositWallet || !prov.usdcBalance || prov.usdcBalance < 0.5) return;
+    depositWrite({
+      address: USDC,
+      abi: erc20Abi,
+      functionName: "transfer",
+      args: [depositWallet, BigInt(Math.floor(prov.usdcBalance * 1e6))],
+    });
+  };
   const quotes = usePrices((s) => s.quotes);
   const stage = useTicket((s) => s.stage);
   const navigate = useNavigate();
@@ -99,7 +143,7 @@ function Desk() {
   // runs; in LIVE mode the bankroll is the wallet's real Polygon USDC.e
   const fwBase = paperMode
     ? (paper.active ? equity : config.startingCapitalUsd)
-    : Math.min(prov.usdcBalance ?? config.budgetUsd, config.budgetUsd);
+    : Math.min((depositWallet ? tradingBal : prov.usdcBalance) ?? config.budgetUsd, config.budgetUsd);
   const eff = effectiveDeskConfig(config, fwBase, paper.active ? paper.startingCapital : config.startingCapitalUsd);
 
   const manualClose = async (p: PaperPosition) => {
@@ -241,6 +285,47 @@ function Desk() {
                   NETWORK MUST BE BRIDGED TO POLYGON USDC + A LITTLE POL FIRST.
                 </p>
               ) : null}
+              <div className="mt-2 border border-accent/25 bg-accent/[0.04] px-2 py-1.5">
+                <div className="label mb-1 text-[9px] text-accent2">TRADING WALLET — POLYMARKET V2 DEPOSIT</div>
+                {depositWallet ? (
+                  <>
+                    <div className="mono-num flex items-center justify-between text-[9.5px] tabular-nums text-dim">
+                      <span>{depositWallet.slice(0, 8)}…{depositWallet.slice(-6)}</span>
+                      <span className={(tradingBal ?? 0) >= 1 ? "text-pos2" : "text-warn2"}>
+                        {tradingBal !== null ? fmt.usd(tradingBal, { compact: false }) : "—"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[9px] leading-relaxed text-faint">
+                      V2 ORDERS EXECUTE FROM THIS WALLET — EOA FUNDS MUST BE DEPOSITED HERE FIRST.
+                    </p>
+                    {(prov.usdcBalance ?? 0) >= 0.5 && (
+                      <button
+                        onClick={depositToTrading}
+                        disabled={depositPending}
+                        className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20 disabled:opacity-50"
+                      >
+                        {depositPending
+                          ? "AWAITING WALLET…"
+                          : `DEPOSIT ${fmt.usd(prov.usdcBalance ?? 0, { compact: false })} → TRADING WALLET`}
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p className="text-[9px] leading-relaxed text-faint">
+                      CLOB V2 EXECUTES FROM YOUR POLYMARKET DEPOSIT WALLET, NOT THE EOA. LINK ONCE TO
+                      DERIVE ITS ADDRESS (ONE SIGNATURE), THEN DEPOSIT FUNDS INTO IT.
+                    </p>
+                    <button
+                      onClick={linkTradingWallet}
+                      disabled={linking || !walletClient}
+                      className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20 disabled:opacity-50"
+                    >
+                      {linking ? "LINKING…" : "LINK TRADING WALLET — 1 SIGNATURE"}
+                    </button>
+                  </>
+                )}
+              </div>
               <div className="mt-2">
                 <NumField
                   label="DESK BUDGET $ — MAX THE DESK MAY DEPLOY"

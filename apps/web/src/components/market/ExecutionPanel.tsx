@@ -81,8 +81,7 @@ export function ExecutionPanel() {
   useEffect(() => {
     if (!open || !auto || autoFired.current || phase !== "compose") return;
     if (!market || !est || orderMode !== "MARKET") return;
-    if (!isConnected || chainId !== polygon.id || !provision.provisioned || !provision.gasReady) return;
-    if (provision.usdcBalance !== null && usd > provision.usdcBalance) return;
+    if (!isConnected || chainId !== polygon.id) return;
     const t = setTimeout(() => {
       autoFired.current = true;
       void executeRef.current?.();
@@ -104,7 +103,9 @@ export function ExecutionPanel() {
   const execNotional = side === "BUY" ? usd : est ? est.shares * est.price : 0;
   const fee = billingQuote(origin, execNotional, sourceOperator?.rank ?? null);
   const wrongChain = isConnected && chainId !== polygon.id;
-  const canTrade = isConnected && !wrongChain && provision.provisioned;
+  // v2: orders are gasless EIP-712 from the deposit wallet; the official
+  // client manages its own approvals — legacy EOA grants no longer gate
+  const canTrade = isConnected && !wrongChain;
   const tick = market.tickSize;
 
   const execute = async () => {
