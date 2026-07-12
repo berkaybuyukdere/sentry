@@ -313,15 +313,24 @@ function Desk() {
                 ) : (
                   <>
                     <p className="text-[9px] leading-relaxed text-faint">
-                      CLOB V2 EXECUTES FROM YOUR POLYMARKET DEPOSIT WALLET, NOT THE EOA. LINK ONCE TO
-                      DERIVE ITS ADDRESS (ONE SIGNATURE), THEN DEPOSIT FUNDS INTO IT.
+                      CLOB V2 EXECUTES FROM YOUR POLYMARKET DEPOSIT WALLET, NOT THE EOA. THE WALLET
+                      MUST BE DEPLOYED BY POLYMARKET'S OWN DEPOSIT FLOW FIRST — THIRD-PARTY RELAYER
+                      KEYS CANNOT DEPLOY IT (VERIFIED: RELAYER REJECTS NON-BOUND ADDRESSES).
                     </p>
+                    <a
+                      href="https://polymarket.com"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-warn/50 bg-warn/10 text-[10px] font-medium uppercase tracking-[0.1em] text-warn2 transition-colors hover:bg-warn/20"
+                    >
+                      STEP 1 — POLYMARKET.COM: LOG IN WITH THIS WALLET + DEPOSIT
+                    </a>
                     <button
                       onClick={linkTradingWallet}
                       disabled={linking || !walletClient}
                       className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20 disabled:opacity-50"
                     >
-                      {linking ? "LINKING…" : "LINK TRADING WALLET — 1 SIGNATURE"}
+                      {linking ? "LINKING…" : "STEP 2 — LINK TRADING WALLET (1 SIGNATURE)"}
                     </button>
                   </>
                 )}
