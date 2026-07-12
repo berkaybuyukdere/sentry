@@ -7,6 +7,7 @@ import {
   testBuilderKey,
   type ImportedClob,
   type BuilderKey,
+  type RelayerV2Key,
 } from "../lib/apiAccess";
 import { Panel, Btn, Tag, cx } from "../components/ui/primitives";
 
@@ -40,6 +41,7 @@ export function SettingsScreen() {
         </Panel>
         <ClobCredsPanel />
         <BuilderKeyPanel />
+        <RelayerV2Panel />
       </div>
     </div>
   );
@@ -153,6 +155,41 @@ function ClobCredsPanel() {
           {status && <Tag tone={status.ok ? "pos" : "neg"}>{status.ok ? "VERIFIED" : "FAILED"}</Tag>}
         </div>
         {status && <div className={cx("mono-num text-[9.5px]", status.ok ? "text-pos" : "text-neg2")}>{status.detail}</div>}
+      </div>
+    </Panel>
+  );
+}
+
+function RelayerV2Panel() {
+  const stored = useApiAccess((s) => s.relayerV2);
+  const setRelayerV2 = useApiAccess((s) => s.setRelayerV2);
+  const [form, setForm] = useState<RelayerV2Key>(stored ?? { key: "", address: "" });
+  const complete = form.key.trim().length > 0 && form.address.trim().length > 0;
+
+  return (
+    <Panel className="border-0" title="RELAYER API KEY — V2 DEPOSIT WALLET">
+      <div className="flex flex-col gap-3">
+        <p className="text-[10.5px] leading-relaxed text-dim">
+          From the Polymarket portal's <span className="text-text">Relayer API keys</span> tab
+          (distinct from the Builders tab above). CLOB v2 needs this to deploy and use your{" "}
+          <span className="text-text">Deposit Wallet</span> gaslessly — without it, order placement
+          fails with "Deposit Wallet deployment requires a Relayer API Key or Builder API Key".
+        </p>
+        <div className="grid grid-cols-2 gap-2.5">
+          <Field label="RELAYER API KEY" value={form.key} onChange={(v) => setForm({ ...form, key: v })} placeholder="019f582d-…" />
+          <Field label="RELAYER API KEY ADDRESS" value={form.address} onChange={(v) => setForm({ ...form, address: v })} placeholder="0x1a5b…3505" />
+        </div>
+        <div className="flex items-center gap-2">
+          <Btn variant="accent" disabled={!complete} onClick={() => setRelayerV2(form)}>
+            STORE
+          </Btn>
+          {stored && (
+            <Btn variant="danger" onClick={() => { setRelayerV2(null); setForm({ key: "", address: "" }); }}>
+              PURGE
+            </Btn>
+          )}
+          {stored && <Tag tone="pos">STORED</Tag>}
+        </div>
       </div>
     </Panel>
   );

@@ -1,4 +1,5 @@
-import { createSecureClient, production, type SecureClient } from "@polymarket/client";
+import { createSecureClient, production, relayerApiKey, type SecureClient } from "@polymarket/client";
+import { useApiAccess } from "../apiAccess";
 import { signerFrom } from "@polymarket/client/viem";
 import type { WalletClient } from "viem";
 
@@ -28,16 +29,24 @@ export function cachedDepositWallet(address: string): `0x${string}` | null {
 }
 
 export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promise<SecureClient> {
-  const key = address.toLowerCase();
+  const rkNow = useApiAccess.getState().relayerV2;
+  // cache key includes the relayer key so storing/changing it in Settings
+  // invalidates the cached client immediately — no page reload needed
+  const key = `${address.toLowerCase()}:${rkNow?.key ?? "none"}`;
   if (cache?.key === key) return cache.client;
   // CLOB v2 rejects direct EOA makers ("maker address not allowed") — orders
   // must come from the account's deterministic Deposit Wallet. Omitting
-  // `wallet` makes createSecureClient derive + set it up (gasless) itself.
+  // `wallet` makes createSecureClient derive + set it up (gasless) itself —
+  // but THAT deployment step itself needs a Relayer or Builder API key
+  // ("Deposit Wallet deployment requires a Relayer API Key or Builder API
+  // Key in the client configuration"), stored via Settings → RELAYER API KEY.
+  const rk = rkNow;
   const client = createSecureClient({
     signer: signerFrom(wallet),
     environment: production,
+    ...(rk ? { apiKey: relayerApiKey({ key: rk.key, address: rk.address }) } : {}),
   }).then((c) => {
-    localStorage.setItem(DW_KEY(key), c.account.wallet);
+    localStorage.setItem(DW_KEY(address.toLowerCase()), c.account.wallet);
     return c;
   });
   cache = { key, client };

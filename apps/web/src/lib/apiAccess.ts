@@ -24,11 +24,23 @@ export interface BuilderKey {
   signerAddress: string;
 }
 
+/** V2 "Relayer API Key" from the Polymarket portal's Relayer API Keys tab —
+ *  a bare {key, address} pair, distinct from the legacy HMAC BuilderKey.
+ *  Fed to `@polymarket/client`'s `relayerApiKey()` so `createSecureClient`
+ *  can deploy/use the Deposit Wallet gaslessly ("Deposit Wallet deployment
+ *  requires a Relayer API Key or Builder API Key" is the error without it). */
+export interface RelayerV2Key {
+  key: string;
+  address: string;
+}
+
 interface ApiAccessState {
   clob: ImportedClob | null;
   builder: BuilderKey | null;
+  relayerV2: RelayerV2Key | null;
   setClob: (c: ImportedClob | null) => void;
   setBuilder: (b: BuilderKey | null) => void;
+  setRelayerV2: (r: RelayerV2Key | null) => void;
 }
 
 export const useApiAccess = create<ApiAccessState>()(
@@ -36,8 +48,10 @@ export const useApiAccess = create<ApiAccessState>()(
     (set) => ({
       clob: null,
       builder: null,
+      relayerV2: null,
       setClob: (clob) => set({ clob: clob ? { ...clob, address: clob.address.toLowerCase() } : null }),
       setBuilder: (builder) => set({ builder }),
+      setRelayerV2: (relayerV2) => set({ relayerV2 }),
     }),
     { name: "sentry.apiAccess" },
   ),
