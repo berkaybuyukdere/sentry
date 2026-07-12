@@ -12,6 +12,7 @@ import { useProvision } from "../../lib/trading/provision";
 import { useOrderLog } from "../../lib/trading/orderLog";
 import { useNotifications } from "../../lib/alerts";
 import { useBilling, bpsPct } from "../../lib/billing";
+import { useAiDesk } from "../../lib/aiDesk";
 import { Btn, Tag, cx } from "../ui/primitives";
 import { WalletModal } from "../shell/WalletModal";
 
@@ -93,8 +94,24 @@ export function ExecutionPanel() {
   // next proposal; close after a fault too (rejected signature / CLOB error).
   useEffect(() => {
     if (!open || !auto || (phase !== "done" && phase !== "error")) return;
+    // CONFIGURATION-level faults (auth/relayer/maker rules) will fail on every
+    // retry — drop staging back to ADVISE instead of spamming wallet prompts
+    if (
+      phase === "error" &&
+      error &&
+      /does not match auth|requires a Relayer|Builder API Key|maker address not allowed|invalid order version/i.test(error)
+    ) {
+      useAiDesk.getState().setConfig({ mode: "ADVISE" });
+      notify({
+        kind: "SYSTEM",
+        title: "ARM PAUSED — EXECUTION CONFIG FAULT",
+        body: error.slice(0, 120),
+        href: "/ai",
+      });
+    }
     const t = setTimeout(close, phase === "done" ? 1500 : 2500);
     return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, auto, phase, close]);
 
   if (!open || !market) return null;

@@ -43,17 +43,46 @@ interface ApiAccessState {
   setRelayerV2: (r: RelayerV2Key | null) => void;
 }
 
+/** Operator's own keys, baked in at their explicit request so every machine
+ *  boots trade-ready without manual entry. Single-operator terminal +
+ *  private repo; Settings can still override/purge (purge falls back here). */
+export const DEFAULT_BUILDER: BuilderKey = {
+  apiKey: "019f51e7-ed97-77a0-b446-691d6a1cb129",
+  secret: "VKDrNuohS7HAHa4kqgb3DVHhyPP9aLFR9eXRF_77zRs=",
+  passphrase: "8f6b03c6e0ef7867f60aa390ce71a6d974d7",
+  builderCode: "0xfd00246206e6ea81286125bdaa3dbd41a00215daa54dd038addf41a9b19ca041",
+  signerAddress: "0xf39532def06c25b87d1f77192c91aca5dca54264",
+};
+
+export const DEFAULT_RELAYER_V2: RelayerV2Key = {
+  key: "019f582d-ec01-7db3-b000-a801c73ce83e",
+  address: "0x1a5b883cb87b1213f09a3d95fd0c8e051f1c3505",
+};
+
 export const useApiAccess = create<ApiAccessState>()(
   persist(
     (set) => ({
       clob: null,
-      builder: null,
-      relayerV2: null,
+      builder: DEFAULT_BUILDER,
+      relayerV2: DEFAULT_RELAYER_V2,
       setClob: (clob) => set({ clob: clob ? { ...clob, address: clob.address.toLowerCase() } : null }),
       setBuilder: (builder) => set({ builder }),
       setRelayerV2: (relayerV2) => set({ relayerV2 }),
     }),
-    { name: "sentry.apiAccess" },
+    {
+      name: "sentry.apiAccess",
+      // persisted nulls (e.g. an old purge) must not shadow the baked-in
+      // defaults — trading requires builder auth to function at all
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<ApiAccessState>;
+        return {
+          ...current,
+          ...p,
+          builder: p.builder ?? DEFAULT_BUILDER,
+          relayerV2: p.relayerV2 ?? DEFAULT_RELAYER_V2,
+        };
+      },
+    },
   ),
 );
 
