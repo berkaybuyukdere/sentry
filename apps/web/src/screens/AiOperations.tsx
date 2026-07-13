@@ -15,6 +15,7 @@ import { useNotifications } from "../lib/alerts";
 import { useProvision } from "../lib/trading/provision";
 import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/trading/v2client";
 import { signAndPlaceOrder, snapToTick } from "../lib/trading/orders";
+import { useSessionSigner, sessionAddress, sessionWalletClient } from "../lib/trading/sessionSigner";
 import { sendLiveMail } from "../lib/liveMail";
 import { USDC, PUSD, LEGACY_DEPOSIT_WALLET } from "../lib/trading/constants";
 import {
@@ -70,11 +71,18 @@ function Desk() {
   const notify = useNotifications((s) => s.push);
   const eliteOps = useSmartFlow((s) => s.elite);
   const prov = useProvision();
-  const { data: walletClient } = useWalletClient();
+  const { data: phantomWalletClient } = useWalletClient();
   const { writeContract: depositWrite, isPending: depositPending } = useWriteContract();
   const [linking, setLinking] = useState(false);
+  // AUTOPILOT: with the session signer armed, the desk's whole trading
+  // identity (signing key + proxy wallet + balances) is the session account —
+  // Phantom stays connected only as the treasury, never prompted per order
+  const sess = useSessionSigner();
+  const autoSign = sess.enabled && !!sess.pk && !!sess.proxyWallet;
   // CLOB v2 executes from the Polymarket Deposit Wallet, not the EOA
-  const { address } = useAccount();
+  const { address: phantomAddress } = useAccount();
+  const address = autoSign ? sessionAddress() : phantomAddress;
+  const walletClient = autoSign ? sessionWalletClient() : phantomWalletClient;
   const depositWallet = address ? cachedDepositWallet(address) : null;
   const twReads = useReadContracts({
     contracts: depositWallet
@@ -95,11 +103,13 @@ function Desk() {
   const [recovering, setRecovering] = useState(false);
 
   const recoverStranded = async () => {
-    if (!walletClient || !address || legacyUnits === 0n) return;
+    // legacy recovery is a MAIN-account operation — always Phantom, even
+    // with autopilot armed (the stranded funds belong to the main EOA)
+    if (!phantomWalletClient || !phantomAddress || legacyUnits === 0n) return;
     setRecovering(true);
     console.info("%c[SENTRY] recovering stranded funds from legacy deposit wallet…", "color:#59f");
     try {
-      const txHash = await recoverLegacyFunds(walletClient, address, legacyUnits);
+      const txHash = await recoverLegacyFunds(phantomWalletClient, phantomAddress, legacyUnits);
       console.info(`%c[SENTRY] RECOVERED — tx ${txHash}`, "color:#3a5;font-weight:bold");
       notify({
         kind: "SYSTEM",
@@ -187,10 +197,17 @@ function Desk() {
   const wins = paper.closed.filter((t) => t.pnl > 0).length;
   const targetProgress = Math.min(Math.max(sessionPnl / Math.max(config.targetProfitUsd, 1), 0), 1);
 
-  // LIVE mode — same KPI shape as PAPER, computed from real fills/marks
+  // LIVE mode — same KPI shape as PAPER, computed from real fills/marks.
+  // KPI sums cover only the CURRENT identity's positions: wallet equity and
+  // baseline are per-wallet, so mixing the other account's cost/marks into
+  // them reports a fictitious P&L (the table below still lists everything).
   const accrue = useBilling((s) => s.accrue);
-  const liveDeployed = desk.liveExecuted.reduce((s, e) => s + e.costUsd, 0);
-  const liveUnrealized = desk.liveExecuted.reduce(
+  const kpiOwned = (e: LiveExecution): boolean => {
+    const owner = e.owner ?? phantomAddress?.toLowerCase();
+    return !!address && owner === address.toLowerCase();
+  };
+  const liveDeployed = desk.liveExecuted.filter(kpiOwned).reduce((s, e) => s + e.costUsd, 0);
+  const liveUnrealized = desk.liveExecuted.filter(kpiOwned).reduce(
     (s, e) => s + (markOf(e.tokenId, e.entryPrice) - e.entryPrice) * e.shares,
     0,
   );
@@ -226,14 +243,24 @@ function Desk() {
 
   const [closingLive, setClosingLive] = useState<string | null>(null);
   const manualCloseLive = async (p: LiveExecution) => {
-    if (!walletClient || !address) return;
+    // the SELL must sign with the identity that OPENED the position — its
+    // proxy holds the shares (pre-autopilot records belong to Phantom)
+    const owner = p.owner ?? phantomAddress?.toLowerCase();
+    const sessAddr = sess.pk ? sessionAddress() : null;
+    const useSession = !!sessAddr && !!sess.proxyWallet && owner === sessAddr.toLowerCase();
+    const wClient = useSession ? sessionWalletClient() : phantomWalletClient;
+    const wAddr = useSession ? sessAddr : phantomAddress;
+    if (!wClient || !wAddr || (owner && wAddr.toLowerCase() !== owner)) {
+      notify({ kind: "SYSTEM", title: "CLOSE BLOCKED — OWNER WALLET UNAVAILABLE", body: `This position was opened by ${owner?.slice(0, 10)}… — connect that wallet (or re-arm its autopilot key) to close it.`, href: "/ai" });
+      return;
+    }
     setClosingLive(p.decisionId);
     try {
       const book = await fetchOrderBook(p.tokenId);
       const stats = bookStats(book);
       const mark = stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : markOf(p.tokenId, p.entryPrice);
       const price = Math.max(p.tickSize, mark * 0.98 - p.tickSize); // slippage-guarded sell bound
-      const res = await signAndPlaceOrder(walletClient, address, {
+      const res = await signAndPlaceOrder(wClient, wAddr, {
         tokenId: p.tokenId,
         side: "SELL",
         price: snapToTick(price, p.tickSize),
@@ -274,8 +301,9 @@ function Desk() {
 
   const executeLive = async (d: DeskDecision) => {
     // silent-failure was the "execute does nothing" bug: every dead end now
-    // tells the operator exactly what is blocking the order
-    if (!isConnected) {
+    // tells the operator exactly what is blocking the order.
+    // The armed session signer needs no extension wallet and no chain switch.
+    if (!autoSign && !isConnected) {
       notify({
         kind: "SYSTEM",
         title: "AI DESK — WALLET REQUIRED",
@@ -284,7 +312,7 @@ function Desk() {
       });
       return;
     }
-    if (chainId !== polygon.id) {
+    if (!autoSign && chainId !== polygon.id) {
       switchChain({ chainId: polygon.id });
       notify({
         kind: "SYSTEM",
@@ -345,7 +373,7 @@ function Desk() {
             </p>
           </Field>
 
-          {!paperMode && isConnected && chainId !== polygon.id && (
+          {!paperMode && !autoSign && isConnected && chainId !== polygon.id && (
             <button
               onClick={() => switchChain({ chainId: polygon.id })}
               className="focus-outline border border-warn/50 bg-warn/10 px-2.5 py-2 text-left text-[9.5px] uppercase leading-relaxed tracking-[0.08em] text-warn2 transition-colors hover:bg-warn/20"
@@ -353,7 +381,7 @@ function Desk() {
               WALLET ON WRONG NETWORK — TAP TO SWITCH TO POLYGON. PHANTOM: USE ITS POLYGON (EVM) SIDE; SOL ON SOLANA MUST BE BRIDGED/SWAPPED TO POLYGON USDC — POLYMARKET SETTLES ON POLYGON ONLY.
             </button>
           )}
-          {!paperMode && !isConnected && (
+          {!paperMode && !autoSign && !isConnected && (
             <div className="border border-line bg-raise px-2.5 py-2 text-[9.5px] uppercase leading-relaxed tracking-[0.08em] text-dim">
               NO WALLET CONNECTED — LIVE ORDERS NEED A POLYGON SIGNATURE. PHANTOM SUPPORTED VIA ITS POLYGON (EVM) SIDE.
             </div>
@@ -497,6 +525,8 @@ function Desk() {
               </Link>
             </div>
           )}
+
+          {!paperMode && <AutopilotSignerPanel />}
 
           <Field label="TEMPO — SPEED OF CAPITAL">
             <div className="grid grid-cols-3 gap-px bg-line">
@@ -798,7 +828,7 @@ function Desk() {
               <Metric
                 label="CASH / DEPLOYED"
                 value={<LiveNum value={tradingBal ?? 0} format={(v) => `${fmt.usd(v)} / ${fmt.usd(liveDeployed)}`} className="text-[17px]" />}
-                sub={`${desk.liveExecuted.length}/${config.maxPositions} positions open`}
+                sub={`${desk.liveExecuted.filter(kpiOwned).length}/${config.maxPositions} positions open${desk.liveExecuted.some((e) => !kpiOwned(e)) ? ` · +${desk.liveExecuted.filter((e) => !kpiOwned(e)).length} other wallet` : ""}`}
               />
               <Metric
                 label="REALIZED P&L"
@@ -1118,6 +1148,170 @@ function Desk() {
           </Panel>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** AUTOPILOT SIGNER — dedicated local trading key so LIVE orders sign with
+ *  ZERO wallet prompts. Hot key by design (operator's explicit request);
+ *  the UI is blunt about the trade-off and the one-time Polymarket setup. */
+function AutopilotSignerPanel() {
+  const sess = useSessionSigner();
+  const notify = useNotifications((s) => s.push);
+  const liveOpen = useAiDesk((s) => s.liveExecuted);
+  const [reveal, setReveal] = useState(false);
+  const [importVal, setImportVal] = useState("");
+  const [proxyVal, setProxyVal] = useState("");
+  const addr = sess.pk ? sessionAddress() : null;
+  const armed = sess.enabled && !!sess.pk && !!sess.proxyWallet;
+  // positions whose shares sit in the SESSION proxy — only this key can ever
+  // sell them; destroying it while they're open strands real money forever
+  const sessionOwnedOpen = addr ? liveOpen.filter((e) => e.owner === addr.toLowerCase()) : [];
+  const phantomOwnedOpen = liveOpen.filter((e) => !addr || e.owner !== addr.toLowerCase());
+
+  return (
+    <div className={cx("border px-2.5 py-2", armed ? "border-pos/50 bg-pos/[0.05]" : "border-line bg-raise")}>
+      <div className="flex items-center justify-between">
+        <span className={cx("label text-[9px]", armed ? "text-pos" : "text-accent2")}>
+          AUTOPILOT SIGNER — ZERO WALLET PROMPTS
+        </span>
+        {sess.pk && sess.proxyWallet && (
+          <button
+            onClick={() => sess.setEnabled(!sess.enabled)}
+            className={cx(
+              "focus-outline h-6 border px-2 text-[9px] font-semibold uppercase tracking-[0.1em] transition-colors",
+              armed ? "border-pos/60 bg-pos/15 text-pos" : "border-line bg-raise2 text-dim hover:text-text",
+            )}
+          >
+            {armed ? "ARMED — CLICK TO DISARM" : "ARM"}
+          </button>
+        )}
+      </div>
+
+      {!sess.pk ? (
+        <>
+          <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
+            EVERY CLOB ORDER IS AN EIP-712 SIGNATURE — WHILE THE KEY LIVES IN PHANTOM, PHANTOM
+            PROMPTS. A DEDICATED SESSION KEY SIGNS SILENTLY. IT IS A HOT KEY STORED ONLY IN THIS
+            BROWSER: KEEP ONLY THE TRADING BANKROLL ON IT.
+          </p>
+          <button
+            onClick={() => {
+              const a = sess.generate();
+              notify({ kind: "SYSTEM", title: "AUTOPILOT KEY GENERATED", body: `Session signer ${a.slice(0, 10)}… created — complete the one-time Polymarket setup.`, href: "/ai" });
+            }}
+            className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20"
+          >
+            GENERATE AUTOPILOT KEY
+          </button>
+          <div className="mt-1.5 flex gap-1">
+            <input
+              value={importVal}
+              onChange={(e) => setImportVal(e.target.value)}
+              placeholder="OR IMPORT EXISTING PRIVATE KEY (0x…)"
+              className="focus-outline mono-num h-7 min-w-0 flex-1 border border-line bg-raise2 px-2 text-[9.5px] text-text placeholder:text-faint"
+            />
+            <Btn
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                const a = sess.importKey(importVal);
+                if (a) {
+                  setImportVal("");
+                  notify({ kind: "SYSTEM", title: "AUTOPILOT KEY IMPORTED", body: `Session signer ${a.slice(0, 10)}… ready.`, href: "/ai" });
+                } else {
+                  notify({ kind: "SYSTEM", title: "INVALID PRIVATE KEY", body: "Expected a 64-hex-char key (0x-prefixed).", href: "/ai" });
+                }
+              }}
+            >
+              IMPORT
+            </Btn>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="mono-num mt-1.5 flex items-center justify-between text-[9.5px] tabular-nums">
+            <span className="text-dim">SIGNER {addr?.slice(0, 8)}…{addr?.slice(-6)}</span>
+            <button onClick={() => setReveal((v) => !v)} className="focus-outline text-[9px] uppercase tracking-[0.1em] text-faint hover:text-warn2">
+              {reveal ? "HIDE KEY" : "REVEAL KEY"}
+            </button>
+          </div>
+          {reveal && (
+            <div className="mono-num mt-1 break-all border border-warn/40 bg-warn/5 px-2 py-1.5 text-[8.5px] text-warn2">
+              {sess.pk}
+            </div>
+          )}
+          {!sess.proxyWallet ? (
+            <>
+              <p className="mt-1.5 text-[9px] leading-relaxed text-warn2">
+                ONE-TIME SETUP: 1) REVEAL KEY → IMPORT INTO PHANTOM. 2) LOG IN AT POLYMARKET.COM
+                WITH THAT ACCOUNT + DEPOSIT (DEPLOYS ITS PROXY WALLET, CONVERTS TO pUSD). 3) PROFILE
+                → "COPY ADDRESS" → PASTE BELOW. 4) ARM. FUND IT FROM THE MAIN WALLET — ONLY THE
+                BANKROLL, IT IS A HOT KEY.
+              </p>
+              <div className="mt-1.5 flex gap-1">
+                <input
+                  value={proxyVal}
+                  onChange={(e) => setProxyVal(e.target.value)}
+                  placeholder="SESSION PROXY WALLET (POLYMARKET PROFILE ADDRESS)"
+                  className="focus-outline mono-num h-7 min-w-0 flex-1 border border-line bg-raise2 px-2 text-[9.5px] text-text placeholder:text-faint"
+                />
+                <Btn
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    if (sess.setProxyWallet(proxyVal)) {
+                      setProxyVal("");
+                      notify({ kind: "SYSTEM", title: "AUTOPILOT PROXY LINKED", body: "Session trading wallet set — ARM to trade with zero prompts.", href: "/ai" });
+                    } else {
+                      notify({ kind: "SYSTEM", title: "INVALID ADDRESS", body: "Expected a 0x… Polygon address from your Polymarket profile.", href: "/ai" });
+                    }
+                  }}
+                >
+                  LINK
+                </Btn>
+              </div>
+            </>
+          ) : (
+            <div className="mono-num mt-1 flex items-center justify-between text-[9.5px] tabular-nums">
+              <span className="text-faint">PROXY {sess.proxyWallet.slice(0, 8)}…{sess.proxyWallet.slice(-6)}</span>
+              <span className={armed ? "text-pos" : "text-faint"}>{armed ? "SIGNING SILENTLY" : "DISARMED"}</span>
+            </div>
+          )}
+          <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
+            {armed
+              ? "NEW LIVE ENTRIES + THEIR EXITS SIGN WITH THE SESSION KEY — NO PROMPTS. BALANCES, KPIs AND ORDERS TRACK THE SESSION PROXY."
+              : "DISARMED — NEW ORDERS FALL BACK TO PHANTOM (ONE PROMPT PER ORDER). SESSION-OWNED POSITIONS STAY MANAGED BY THE KEY."}
+          </p>
+          {armed && phantomOwnedOpen.length > 0 && (
+            <p className="mt-1 text-[9px] leading-relaxed text-warn2">
+              {phantomOwnedOpen.length} OPEN POSITION{phantomOwnedOpen.length > 1 ? "S" : ""} BELONG
+              {phantomOwnedOpen.length > 1 ? "" : "S"} TO THE MAIN WALLET — KEEP PHANTOM CONNECTED ON
+              POLYGON SO THEIR TP/SL EXITS CAN STILL SIGN (THOSE WILL PROMPT).
+            </p>
+          )}
+          <button
+            onClick={() => {
+              if (sessionOwnedOpen.length > 0) {
+                notify({
+                  kind: "SYSTEM",
+                  title: "REMOVE BLOCKED — OPEN SESSION POSITIONS",
+                  body: `${sessionOwnedOpen.length} open position(s) can ONLY be sold by this key. Close them (or wait for exits), withdraw the proxy funds, then remove.`,
+                  href: "/ai",
+                });
+                return;
+              }
+              if (window.confirm("Remove the autopilot key from this browser? Withdraw the session proxy's funds first — the key CANNOT be recovered and anything left behind is unreachable forever.")) {
+                sess.clear();
+                setReveal(false);
+              }
+            }}
+            className="focus-outline mt-1.5 flex h-7 w-full items-center justify-center border border-neg/40 bg-neg/5 text-[9px] font-medium uppercase tracking-[0.1em] text-neg2 transition-colors hover:bg-neg/10"
+          >
+            REMOVE KEY FROM THIS BROWSER
+          </button>
+        </>
+      )}
     </div>
   );
 }

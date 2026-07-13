@@ -2,6 +2,7 @@ import { createSecureClient, production, forkEnvironmentConfig, relayerApiKey, t
 import { useApiAccess } from "../apiAccess";
 import { POLY_PROXY_WALLET, LEGACY_DEPOSIT_WALLET, USDC } from "./constants";
 import { builderApiKeyBrowser } from "./builderAuth";
+import { useSessionSigner, sessionAddress } from "./sessionSigner";
 import { signerFrom } from "@polymarket/client/viem";
 import type { WalletClient } from "viem";
 
@@ -27,16 +28,23 @@ import type { WalletClient } from "viem";
 const RELIABLE_RPC = "https://polygon-bor-rpc.publicnode.com";
 const environment = forkEnvironmentConfig({ name: "sentry", rpc: RELIABLE_RPC }, production);
 
-let cache: { key: string; client: Promise<SecureClient> } | null = null;
+// keyed by signer identity + auth: the desk can alternate between the main
+// Phantom account and the autopilot session signer within one exit tick — a
+// single-slot cache would re-handshake (and re-prompt Phantom) on every swap
+const cache = new Map<string, Promise<SecureClient>>();
 
 const DW_KEY = (addr: string) => `sentry.depositWallet.${addr.toLowerCase()}`;
 
-/** The trading wallet SENTRY funds and trades from — pinned to the operator's
- *  REAL Polymarket proxy wallet (POLY_PROXY_WALLET, confirmed on-chain: pUSD
- *  balance matches the site's Cash exactly, plus an already-maxed v2-exchange
- *  allowance). Two earlier guesses (self-derived SDK wallet, "Transfer
- *  Crypto" modal address) were both wrong — see the comment in constants.ts. */
-export function cachedDepositWallet(_address: string): `0x${string}` | null {
+/** The trading wallet SENTRY funds and trades from. For the operator's main
+ *  EOA this is the REAL Polymarket proxy wallet (POLY_PROXY_WALLET, confirmed
+ *  on-chain: pUSD balance matches the site's Cash exactly, plus an
+ *  already-maxed v2-exchange allowance — see constants.ts for the chase). For
+ *  the AUTOPILOT session signer it is that account's own proxy, pasted from
+ *  its polymarket.com profile — never guessed (v21 lesson). */
+export function cachedDepositWallet(address: string): `0x${string}` | null {
+  const sess = useSessionSigner.getState();
+  const sessAddr = sessionAddress();
+  if (sessAddr && address.toLowerCase() === sessAddr.toLowerCase()) return sess.proxyWallet;
   return POLY_PROXY_WALLET;
 }
 
@@ -51,15 +59,32 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
   // does not match auth 0x…") — deployment must happen through Polymarket's
   // own deposit flow (polymarket.com, same wallet). Once deployed, the
   // client skips deployment entirely and orders never touch the relayer.
-  const auth = relayerV2
+  // A relayer key only authenticates its own bound address — attaching it to
+  // a DIFFERENT signer (the autopilot session key) manufactures the exact
+  // "does not match auth" fault we spent v11–v13 killing, so it is only
+  // passed when the bound address matches the signing address.
+  const relayerMatches = relayerV2 && relayerV2.address.toLowerCase() === address.toLowerCase();
+  const auth = relayerMatches
     ? relayerApiKey({ key: relayerV2.key, address: relayerV2.address })
     : builder
       ? builderApiKeyBrowser({ key: builder.apiKey, secret: builder.secret, passphrase: builder.passphrase })
       : undefined;
+  // the maker wallet is signer-dependent: main EOA → confirmed proxy wallet;
+  // session signer → its own pasted proxy (cachedDepositWallet resolves both).
+  // A session account with NO proxy linked must never fall through to the
+  // client's self-derived wallet — that is the exact wrong-maker path that
+  // stranded funds in LEGACY_DEPOSIT_WALLET (v19/v20). Fail loudly instead.
+  const makerWallet = cachedDepositWallet(address);
+  if (!makerWallet) {
+    throw new Error(
+      "Session account has no linked proxy wallet — deposit on polymarket.com with this account, then paste its profile address into AUTOPILOT SIGNER before trading.",
+    );
+  }
   // cache key includes the auth identity so changing keys in Settings
   // invalidates the cached client immediately — no page reload needed
-  const key = `${address.toLowerCase()}:${relayerV2?.key ?? builder?.apiKey ?? "none"}`;
-  if (cache?.key === key) return cache.client;
+  const key = `${address.toLowerCase()}:${makerWallet}:${(relayerMatches && relayerV2?.key) || builder?.apiKey || "none"}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
   // CLOB v2 rejects direct EOA makers ("maker address not allowed") — orders
   // must come from the account's deterministic Deposit Wallet. Omitting
   // `wallet` makes createSecureClient derive + set it up (gasless) itself —
@@ -69,15 +94,15 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
   const client = createSecureClient({
     signer: signerFrom(wallet),
     environment,
-    wallet: POLY_PROXY_WALLET,
+    wallet: makerWallet,
     ...(auth ? { apiKey: auth } : {}),
   }).then((c) => {
     localStorage.setItem(DW_KEY(address.toLowerCase()), c.account.wallet);
     return c;
   });
-  cache = { key, client };
+  cache.set(key, client);
   client.catch(() => {
-    cache = null; // never cache a failed handshake
+    cache.delete(key); // never cache a failed handshake
   });
   return client;
 }

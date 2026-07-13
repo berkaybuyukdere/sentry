@@ -16,6 +16,7 @@ import { useOrderLog } from "../../lib/trading/orderLog";
 import { useNotifications } from "../../lib/alerts";
 import { useBilling, bpsPct } from "../../lib/billing";
 import { useAiDesk } from "../../lib/aiDesk";
+import { useSessionSigner, sessionAddress, sessionWalletClient } from "../../lib/trading/sessionSigner";
 import { sendLiveMail } from "../../lib/liveMail";
 import { Btn, Tag, cx } from "../ui/primitives";
 import { WalletModal } from "../shell/WalletModal";
@@ -26,12 +27,18 @@ export function ExecutionPanel() {
   const { open, market, outcomeIndex, side, presetUsd, origin, sourceOperator, auto, close } = useTicket();
   const billingQuote = useBilling((s) => s.quote);
   const accrue = useBilling((s) => s.accrue);
-  const { address, isConnected, chainId } = useAccount();
-  const { data: walletClient } = useWalletClient();
+  const { address: phantomAddress, isConnected, chainId } = useAccount();
+  const { data: phantomWalletClient } = useWalletClient();
   const { switchChain } = useSwitchChain();
   const provision = useProvision();
   const logOrder = useOrderLog((s) => s.log);
   const notify = useNotifications((s) => s.push);
+  // AUTOPILOT: when the session signer is armed, IT is the trading identity —
+  // its key signs (zero Phantom prompts) and its proxy wallet is the bankroll
+  const sess = useSessionSigner();
+  const autoSign = sess.enabled && !!sess.pk && !!sess.proxyWallet;
+  const address = autoSign ? sessionAddress() : phantomAddress;
+  const walletClient = autoSign ? sessionWalletClient() : phantomWalletClient;
   // V2 orders execute from the Polymarket Deposit Wallet, not the EOA — once
   // linked, ITS balance is what actually gates whether an order can fill
   // ("INSUFFICIENT USDC — AVAILABLE $0" was reading the now-empty EOA)
@@ -103,7 +110,8 @@ export function ExecutionPanel() {
   useEffect(() => {
     if (!open || !auto || autoFired.current || phase !== "compose") return;
     if (!market || !est || orderMode !== "MARKET") return;
-    if (!isConnected || chainId !== polygon.id) return;
+    // session signer needs no extension wallet and is chain-pinned to Polygon
+    if (!autoSign && (!isConnected || chainId !== polygon.id)) return;
     const t = setTimeout(() => {
       autoFired.current = true;
       void executeRef.current?.();
@@ -146,10 +154,11 @@ export function ExecutionPanel() {
   const outcome = market.outcomes[outcomeIndex] ?? "—";
   const execNotional = side === "BUY" ? usd : est ? est.shares * est.price : 0;
   const fee = billingQuote(origin, execNotional, sourceOperator?.rank ?? null);
-  const wrongChain = isConnected && chainId !== polygon.id;
+  const wrongChain = !autoSign && isConnected && chainId !== polygon.id;
   // v2: orders are gasless EIP-712 from the deposit wallet; the official
-  // client manages its own approvals — legacy EOA grants no longer gate
-  const canTrade = isConnected && !wrongChain;
+  // client manages its own approvals — legacy EOA grants no longer gate.
+  // The armed session signer trades with no extension wallet at all.
+  const canTrade = autoSign || (isConnected && !wrongChain);
   const tick = market.tickSize;
 
   const execute = async () => {
@@ -188,6 +197,7 @@ export function ExecutionPanel() {
         txHash: res.transactionsHashes?.[0] ?? null,
         status: res.status ?? (res.success ? "SUBMITTED" : "REJECTED"),
         error: res.errorMsg || null,
+        signer: address?.toLowerCase(),
       });
       if (res.success) {
         setPhase("done");
@@ -375,7 +385,7 @@ export function ExecutionPanel() {
           </div>
 
           {/* gates + execute */}
-          {!isConnected ? (
+          {!isConnected && !autoSign ? (
             <Btn variant="accent" size="lg" onClick={() => setWalletOpen(true)}>
               CONNECT WALLET TO EXECUTE
             </Btn>

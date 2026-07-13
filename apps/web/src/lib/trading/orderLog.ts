@@ -17,6 +17,10 @@ export interface LoggedOrder {
   txHash: string | null;
   status: string;
   error: string | null;
+  /** lowercase EOA that signed the order — the position's owner. Captured at
+   *  FIRE time; deriving it later from the currently-active identity races
+   *  with arm/disarm toggles. Absent on pre-autopilot records (Phantom's). */
+  signer?: string;
 }
 
 interface OrderLogState {

@@ -26,6 +26,7 @@ import { useLiveRef, cryptoAlignment, type RefRow } from "./liveRef";
 import { useSmartFlow, type SmartBuy } from "./smartFlow";
 import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
 import { cachedDepositWallet } from "./trading/v2client";
+import { useSessionSigner, sessionAddress, sessionWalletClient } from "./trading/sessionSigner";
 import { signAndPlaceOrder, snapToTick } from "./trading/orders";
 import { sendLiveMail, type LiveMailKpi } from "./liveMail";
 
@@ -208,6 +209,10 @@ export interface LiveExecution {
   migrated?: boolean;
   /** unix seconds of the one-time rebase for migrated positions */
   rebasedTs?: number;
+  /** lowercase EOA that OPENED the position — exits must sign with the same
+   *  identity (its proxy holds the shares). Absent on pre-autopilot records,
+   *  which all belonged to the main Phantom account. */
+  owner?: string;
 }
 
 export interface LiveClosedTrade {
@@ -1055,9 +1060,21 @@ export function useAiDeskEngine() {
   const smartBuys = useSmartFlow((s) => s.buys);
   // LIVE bankroll is REAL on-chain money — CLOB v2 executes from the
   // Polymarket Deposit Wallet, so once it's linked we read ITS balances
-  // (USDC.e + pUSD, the v2 collateral) instead of the EOA's
-  const { address: liveAddress } = useAccount();
+  // (USDC.e + pUSD, the v2 collateral) instead of the EOA's.
+  // AUTOPILOT: when the session signer is armed, the desk's identity IS the
+  // session account — its proxy holds the bankroll and its key signs exits —
+  // so every read and every order routes through it instead of Phantom.
+  const sess = useSessionSigner();
+  const autoOn = sess.enabled && !!sess.pk && !!sess.proxyWallet;
+  const { address: phantomAddress } = useAccount();
+  const liveAddress = autoOn ? (sessionAddress() ?? undefined) : phantomAddress;
   const liveTarget = liveAddress ? (cachedDepositWallet(liveAddress) ?? liveAddress) : undefined;
+  // position ownership: exits, P&L and the cash floor are all PER-IDENTITY.
+  // Records without an owner predate autopilot — they are Phantom's.
+  const ownerOf = (e: LiveExecution): string | null =>
+    (e.owner ?? phantomAddress?.toLowerCase()) ?? null;
+  const ownedByLive = (e: LiveExecution): boolean =>
+    !!liveAddress && ownerOf(e) === liveAddress.toLowerCase();
   const { data: liveBalRaw, dataUpdatedAt: liveBalAsOf } = useReadContracts({
     contracts: liveTarget
       ? [
@@ -1076,7 +1093,7 @@ export function useAiDeskEngine() {
   // corrected figure — back-to-back ARM fills inside one poll window were
   // able to spend straight through the profit-lock floor otherwise.
   const pendingSpend = desk.liveExecuted
-    .filter((e) => e.ts * 1000 > (liveBalAsOf ?? 0) - 2_000)
+    .filter((e) => ownedByLive(e) && e.ts * 1000 > (liveBalAsOf ?? 0) - 2_000)
     .reduce((s, e) => s + e.costUsd, 0);
   const liveCash = liveUsdc !== null ? Math.max(0, liveUsdc - pendingSpend) : null;
 
@@ -1096,7 +1113,7 @@ export function useAiDeskEngine() {
       targetUsd: st.config.targetProfitUsd,
       sessionPnlUsd:
         st.liveBaseline !== null && cash !== null
-          ? cash + st.liveExecuted.reduce((s, e) => s + e.costUsd, 0) - st.liveBaseline
+          ? cash + st.liveExecuted.filter(ownedByLive).reduce((s, e) => s + e.costUsd, 0) - st.liveBaseline
           : null,
     };
   };
@@ -1179,7 +1196,10 @@ export function useAiDeskEngine() {
           ? Math.max(0, Math.min(liveCash - floor, config.budgetUsd))
           : 0 // fail closed under an active lock
         : Math.min(liveCash ?? config.budgetUsd, config.budgetUsd);
-    const openSlots = Math.max(0, effCfg.maxPositions - (config.executionMode === "PAPER" ? st.paper.positions.length : st.liveExecuted.length));
+    // slots count only the CURRENT identity's positions — the other account's
+    // book (e.g. Phantom's legacy positions while autopilot is armed) must not
+    // starve this identity's deployment
+    const openSlots = Math.max(0, effCfg.maxPositions - (config.executionMode === "PAPER" ? st.paper.positions.length : st.liveExecuted.filter(ownedByLive).length));
     const { decisions: fresh, scan } = sweepUniverse(
       universe, signals, tape, effCfg, billingTierRateBps, equity, exclude, excludeEvents, openSlots, cryptoRows, smartBuys,
     );
@@ -1398,8 +1418,10 @@ export function useAiDeskEngine() {
       // moves realized P&L only. Raw cash delta would read every deployment
       // as a loss and every returning principal as profit. liveCash (pending-
       // spend-corrected) keeps a just-filled entry from inflating P&L for the
-      // ~10s until the balance poll catches up.
-      const openCost = desk.liveExecuted.reduce((s, e) => s + e.costUsd, 0);
+      // ~10s until the balance poll catches up. Only the CURRENT identity's
+      // positions count — mixing the other account's cost basis into this
+      // wallet's cash delta would corrupt target/brake/ladder math.
+      const openCost = desk.liveExecuted.filter(ownedByLive).reduce((s, e) => s + e.costUsd, 0);
       const pnl = liveCash + openCost - desk.liveBaseline;
       if (pnl >= config.targetProfitUsd) {
         desk.setHalt(`TARGET REACHED — +$${pnl.toFixed(2)} LIVE (WALLET-MEASURED) · DESK STANDBY`);
@@ -1431,6 +1453,26 @@ export function useAiDeskEngine() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engaged, paper, quotes, config, liveUsdc]);
 
+  // identity flip (ARM/DISARM) mid-session: the baseline/ladder were anchored
+  // to the OTHER wallet's cash — measuring session-proxy cash against a
+  // Phantom-era baseline fires fictitious LOSS BRAKE / TARGET halts and banks
+  // phantom profit locks. A signer change always stands the desk down and
+  // resets the anchors; the operator re-engages under the new identity.
+  const prevIdentity = useRef<string | null>(null);
+  useEffect(() => {
+    const id = liveAddress?.toLowerCase() ?? null;
+    if (prevIdentity.current !== null && prevIdentity.current !== id && config.executionMode === "LIVE") {
+      if (desk.liveBaseline !== null) desk.setLiveBaseline(null);
+      if (desk.lockedProfitUsd !== 0) desk.setLockedProfit(0);
+      if (engaged) {
+        desk.setHalt("SIGNER CHANGED — RE-ENGAGE UNDER THE NEW TRADING IDENTITY");
+        notify({ kind: "SYSTEM", title: "AI DESK — SIGNER CHANGED", body: "Trading identity switched; P&L anchors reset. Re-engage to continue.", href: "/ai" });
+      }
+    }
+    prevIdentity.current = id;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveAddress, config.executionMode]);
+
   // LIVE baseline: wallet balance snapshot at engage; cleared on stand-down —
   // the target is measured against REAL money, deposits mid-session skew it.
   // The profit lock lives and dies with the baseline: a fresh engage gets a
@@ -1441,7 +1483,7 @@ export function useAiDeskEngine() {
       // re-engaging after a reload) with positions deployed must not count
       // their returning principal as fresh profit — otherwise the ladder
       // banks capital as if it were gains and the target fires spuriously.
-      const openCost = useAiDesk.getState().liveExecuted.reduce((s, e) => s + e.costUsd, 0);
+      const openCost = useAiDesk.getState().liveExecuted.filter(ownedByLive).reduce((s, e) => s + e.costUsd, 0);
       desk.setLiveBaseline(liveCash + openCost);
     }
     if (!engaged && desk.liveBaseline !== null) {
@@ -1454,14 +1496,16 @@ export function useAiDeskEngine() {
   // ---- LIVE: ARM auto-staging + order-log linking ---------------------------
   useEffect(() => {
     if (!engaged || config.executionMode !== "LIVE" || config.mode !== "ARM" || ticketOpen) return;
-    if (desk.liveExecuted.length >= config.maxPositions) return;
+    if (desk.liveExecuted.filter(ownedByLive).length >= config.maxPositions) return;
     const next = decisions
       .filter((d) => d.status === "PROPOSED" && d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
-      // hard cash floor: with a profit lock active, an entry may only spend
-      // cash ABOVE baseline+locked, measured against the pending-spend-corrected
-      // balance. A dead balance feed fails CLOSED while a lock is active.
+      // hard cash floor: an entry may only spend cash the desk has actually
+      // SEEN (pending-spend-corrected), and with a profit lock active only
+      // cash ABOVE baseline+locked. Unknown balance fails CLOSED — with the
+      // session signer there is no human prompt left to catch a blind order,
+      // and staging from budgetUsd against a $0 proxy just bounce-loops.
       .filter((d) => {
-        if (liveCash === null) return liveCashFloor === null;
+        if (liveCash === null) return false;
         return d.sizeUsd <= (liveCashFloor !== null ? liveCash - liveCashFloor : liveCash);
       })
       .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)[0];
@@ -1509,6 +1553,9 @@ export function useAiDeskEngine() {
           tpPrice: Math.min(0.99, entryMid * (1 + d.tpFrac)),
           slPrice: Math.max(0.01, entryMid * (1 - d.slFrac)),
           deadline: Math.floor(Date.now() / 1000) + effCfg.maxHoldMin * 60,
+          // fire-time signer beats the currently-active identity — the user
+          // may have toggled ARM between the fill and this match tick
+          owner: match.signer ?? liveAddress?.toLowerCase(),
         });
         accrue(feeQuote, { market: d.question, notionalUsd: match.usd });
         sendLiveMail({
@@ -1535,11 +1582,17 @@ export function useAiDeskEngine() {
   // live book (not a stale WS quote), SL needs 2 consecutive breaching ticks,
   // and a "take profit" is verified against the actual bid-side sell before
   // it's allowed to close — a mid that ran ahead of exit liquidity holds.
-  const { data: liveWalletClient } = useWalletClient();
+  const { data: phantomWalletClient } = useWalletClient();
+  // exits sign PER POSITION with the identity that OPENED it — the session
+  // proxy holds no shares of Phantom-opened positions and vice versa. Session
+  // positions stay managed even while DISARMED, as long as the key exists.
+  const sessReady = !!sess.pk && !!sess.proxyWallet;
   const liveClosing = useRef(false);
   const liveSlBreach = useRef(new Map<string, number>());
+  const liveUnmanagedWarned = useRef(new Set<string>()); // one warning per stuck position
   useEffect(() => {
-    if (config.executionMode !== "LIVE" || !desk.liveExecuted.length || !liveWalletClient || !liveAddress) return;
+    if (config.executionMode !== "LIVE" || !desk.liveExecuted.length) return;
+    if (!phantomWalletClient && !sessReady) return; // no signer available at all
     const tick = async () => {
       if (liveClosing.current) return;
       liveClosing.current = true;
@@ -1587,6 +1640,38 @@ export function useAiDeskEngine() {
               const previewFee = quote("SIGNAL", previewProceeds).feeUsd;
               if (previewProceeds - previewFee - p.costUsd - p.feeUsd <= 0) continue;
             }
+            // the SELL must come from the account whose proxy holds the
+            // shares — resolve the signer from the position's owner
+            const owner = ownerOf(p);
+            const sessAddr = sessionAddress();
+            const useSession = sessReady && !!sessAddr && owner === sessAddr.toLowerCase();
+            const wClient = useSession ? sessionWalletClient() : phantomWalletClient;
+            const wAddr = useSession ? sessAddr : phantomAddress;
+            if (!wClient || !wAddr || (owner !== null && wAddr.toLowerCase() !== owner)) {
+              // owning wallet unavailable — hold, but NEVER silently: an
+              // exit trigger with no signer means TP/SL protection is dead
+              // for this position until that wallet comes back
+              if (!liveUnmanagedWarned.current.has(p.decisionId)) {
+                liveUnmanagedWarned.current.add(p.decisionId);
+                notify({
+                  kind: "SYSTEM",
+                  title: "LIVE EXIT BLOCKED — OWNER WALLET UNAVAILABLE",
+                  body: `${p.question.slice(0, 56)} hit an exit trigger but its owning wallet (${owner?.slice(0, 10) ?? "unknown"}…) is not available to sign. Reconnect it — TP/SL cannot fire until then.`,
+                  href: "/ai",
+                });
+                sendLiveMail({
+                  kind: "FAULT",
+                  key: `unmanaged:${p.decisionId}`,
+                  title: "EXIT BLOCKED — OWNER WALLET UNAVAILABLE",
+                  detail: `An exit trigger fired but the owning wallet ${owner?.slice(0, 12) ?? "(unknown)"}… is unavailable to sign the SELL. The position is UNPROTECTED until that wallet reconnects.`,
+                  market: p.question,
+                  outcome: p.outcome,
+                  kpi: liveMailKpi(),
+                });
+              }
+              continue;
+            }
+            liveUnmanagedWarned.current.delete(p.decisionId);
             // fresh universe row is ground truth for order params — the stored
             // values may be migration defaults on pre-upgrade positions
             const mkt = universe?.find((m) => m.slug === p.slug);
@@ -1594,7 +1679,7 @@ export function useAiDeskEngine() {
             const negRisk = mkt?.negRisk ?? p.negRisk;
             const price = Math.max(tickSize, mark * 0.98 - tickSize); // slippage-guarded sell bound
             const snapped = snapToTick(price, tickSize);
-            const res = await signAndPlaceOrder(liveWalletClient, liveAddress, {
+            const res = await signAndPlaceOrder(wClient, wAddr, {
               tokenId: p.tokenId,
               side: "SELL",
               price: snapped,
@@ -1643,5 +1728,5 @@ export function useAiDeskEngine() {
     void tick();
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [config.executionMode, desk.liveExecuted.length, liveWalletClient, liveAddress]);
+  }, [config.executionMode, desk.liveExecuted.length, phantomWalletClient, phantomAddress, sessReady]);
 }
