@@ -12,6 +12,18 @@ export const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296" as 
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
+// Operator-specific wallets (baked; single-operator terminal — same policy as
+// the baked API keys in apiAccess.ts):
+// POLY_PROXY_WALLET — polymarket.com's own proxy for the operator's EOA
+// (0xd99b…1827). The website deposits/converts/trades through THIS address;
+// the v2 client must use the same one or balances live in two different
+// invisible places (learned the hard way — see LEGACY_DEPOSIT_WALLET).
+export const POLY_PROXY_WALLET = "0x1F6F8d1f06ec5dC4B575b33ECa448f3466F79886" as const;
+// LEGACY_DEPOSIT_WALLET — the beta client's own depositWalletFactory
+// derivation (createSecureClient with `wallet` omitted). $18.96 USDC.e was
+// parked here on 2026-07-13; kept only so the recovery flow can pull it back.
+export const LEGACY_DEPOSIT_WALLET = "0x0947b5923e2b8855045dc6de4519f1cdbcb73514" as const;
+
 export const CLOB_HOST = "https://clob.polymarket.com";
 
 export const ERC20_ABI = [

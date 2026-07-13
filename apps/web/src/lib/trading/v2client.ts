@@ -1,5 +1,6 @@
 import { createSecureClient, production, forkEnvironmentConfig, relayerApiKey, type SecureClient } from "@polymarket/client";
 import { useApiAccess } from "../apiAccess";
+import { POLY_PROXY_WALLET, LEGACY_DEPOSIT_WALLET, USDC } from "./constants";
 import { builderApiKeyBrowser } from "./builderAuth";
 import { signerFrom } from "@polymarket/client/viem";
 import type { WalletClient } from "viem";
@@ -30,11 +31,13 @@ let cache: { key: string; client: Promise<SecureClient> } | null = null;
 
 const DW_KEY = (addr: string) => `sentry.depositWallet.${addr.toLowerCase()}`;
 
-/** Deposit (trading) wallet derived for this EOA on a previous client
- *  handshake — lets passive UI show the trading wallet without a signature. */
-export function cachedDepositWallet(address: string): `0x${string}` | null {
-  const v = localStorage.getItem(DW_KEY(address));
-  return v && v.startsWith("0x") ? (v as `0x${string}`) : null;
+/** The trading wallet SENTRY funds and trades from. This is now pinned to
+ *  polymarket.com's OWN proxy wallet for the operator's EOA — the beta
+ *  client's self-derived deposit wallet (see LEGACY_DEPOSIT_WALLET) was a
+ *  parallel, website-invisible wallet: money sent there never appeared in
+ *  the site's Cash and pUSD conversion could never reach it. */
+export function cachedDepositWallet(_address: string): `0x${string}` | null {
+  return POLY_PROXY_WALLET;
 }
 
 export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promise<SecureClient> {
@@ -66,6 +69,9 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
   const client = createSecureClient({
     signer: signerFrom(wallet),
     environment,
+    // trade from the SAME wallet polymarket.com uses for this EOA — deposits,
+    // pUSD conversion, and Cash on the site all live at this address
+    wallet: POLY_PROXY_WALLET,
     ...(auth ? { apiKey: auth } : {}),
   }).then((c) => {
     localStorage.setItem(DW_KEY(address.toLowerCase()), c.account.wallet);
@@ -76,4 +82,36 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
     cache = null; // never cache a failed handshake
   });
   return client;
+}
+
+/**
+ * Pulls stranded funds out of the beta client's self-derived deposit wallet
+ * (LEGACY_DEPOSIT_WALLET) back to the operator's own EOA. One-off client
+ * bound to the legacy wallet; the transfer runs through the gasless relayer
+ * and is signed by the user's wallet — nothing custodial.
+ */
+export async function recoverLegacyFunds(
+  wallet: WalletClient,
+  address: `0x${string}`,
+  amountUnits: bigint,
+): Promise<string> {
+  const { relayerV2, builder } = useApiAccess.getState();
+  const auth = relayerV2
+    ? relayerApiKey({ key: relayerV2.key, address: relayerV2.address })
+    : builder
+      ? builderApiKeyBrowser({ key: builder.apiKey, secret: builder.secret, passphrase: builder.passphrase })
+      : undefined;
+  const client = await createSecureClient({
+    signer: signerFrom(wallet),
+    environment,
+    wallet: LEGACY_DEPOSIT_WALLET,
+    ...(auth ? { apiKey: auth } : {}),
+  });
+  const handle = await client.transferErc20({
+    amount: amountUnits,
+    recipientAddress: address,
+    tokenAddress: USDC,
+  });
+  const outcome = await handle.wait();
+  return outcome.transactionHash;
 }

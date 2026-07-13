@@ -13,8 +13,8 @@ import { useLiveRef } from "../lib/liveRef";
 import { useSmartFlow } from "../lib/smartFlow";
 import { useNotifications } from "../lib/alerts";
 import { useProvision } from "../lib/trading/provision";
-import { cachedDepositWallet, getV2Client } from "../lib/trading/v2client";
-import { USDC, PUSD } from "../lib/trading/constants";
+import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/trading/v2client";
+import { USDC, PUSD, LEGACY_DEPOSIT_WALLET } from "../lib/trading/constants";
 import {
   useAiDesk,
   paperEquity,
@@ -78,6 +78,8 @@ function Desk() {
       ? [
           { address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
           { address: PUSD, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
+          // beta client's self-derived wallet — stranded-fund recovery source
+          { address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [LEGACY_DEPOSIT_WALLET] },
         ]
       : [],
     query: { enabled: !!depositWallet, refetchInterval: 15_000 },
@@ -85,6 +87,32 @@ function Desk() {
   const twUsdcBal = twReads.data ? Number((twReads.data[0]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
   const twPusdBal = twReads.data ? Number((twReads.data[1]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
   const tradingBal = twReads.data ? (twUsdcBal ?? 0) + (twPusdBal ?? 0) : null;
+  const legacyUnits = (twReads.data?.[2]?.result as bigint | undefined) ?? 0n;
+  const legacyBal = twReads.data ? Number(legacyUnits) / 1e6 : 0;
+  const [recovering, setRecovering] = useState(false);
+
+  const recoverStranded = async () => {
+    if (!walletClient || !address || legacyUnits === 0n) return;
+    setRecovering(true);
+    console.info("%c[SENTRY] recovering stranded funds from legacy deposit wallet…", "color:#59f");
+    try {
+      const txHash = await recoverLegacyFunds(walletClient, address, legacyUnits);
+      console.info(`%c[SENTRY] RECOVERED — tx ${txHash}`, "color:#3a5;font-weight:bold");
+      notify({
+        kind: "SYSTEM",
+        title: "FUNDS RECOVERED",
+        body: `${fmt.usd(legacyBal, { compact: false })} returned to your wallet — tx ${txHash.slice(0, 14)}…`,
+        href: "/treasury",
+      });
+      void twReads.refetch();
+    } catch (e) {
+      console.error("[SENTRY] recovery failed:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      notify({ kind: "SYSTEM", title: "RECOVERY FAILED", body: msg.slice(0, 200), href: "/ai" });
+    } finally {
+      setRecovering(false);
+    }
+  };
   // CLOB v2 settles ONLY in pUSD — USDC.e sitting in the deposit wallet reads
   // as spendable balance here (it's real money) but the exchange contract
   // sees zero collateral until it's converted 1:1 on polymarket.com
@@ -312,8 +340,25 @@ function Desk() {
                       </span>
                     </div>
                     <p className="mt-1 text-[9px] leading-relaxed text-faint">
-                      V2 ORDERS EXECUTE FROM THIS WALLET — EOA FUNDS MUST BE DEPOSITED HERE FIRST.
+                      THIS IS POLYMARKET.COM'S OWN WALLET FOR YOUR ACCOUNT — DEPOSITS AND CASH ON
+                      THE SITE LIVE HERE, AND SENTRY NOW TRADES FROM THE SAME PLACE.
                     </p>
+                    {legacyBal > 0.5 && (
+                      <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">
+                        <p className="text-[9px] leading-relaxed text-warn2">
+                          {fmt.usd(legacyBal, { compact: false })} IS STRANDED IN AN OLD SYSTEM WALLET
+                          ({LEGACY_DEPOSIT_WALLET.slice(0, 8)}…) — INVISIBLE TO POLYMARKET.COM. PULL IT
+                          BACK TO YOUR OWN WALLET, THEN DEPOSIT VIA THE SITE.
+                        </p>
+                        <button
+                          onClick={recoverStranded}
+                          disabled={recovering || !walletClient}
+                          className="focus-outline mt-1 flex h-8 w-full items-center justify-center border border-warn/50 bg-warn/10 text-[10px] font-medium uppercase tracking-[0.1em] text-warn2 transition-colors hover:bg-warn/20 disabled:opacity-50"
+                        >
+                          {recovering ? "RECOVERING — SIGN IN WALLET…" : `RECOVER ${fmt.usd(legacyBal, { compact: false })} → MY WALLET`}
+                        </button>
+                      </div>
+                    )}
                     {needsPusdConversion && (
                       <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">
                         <p className="text-[9px] leading-relaxed text-warn2">
