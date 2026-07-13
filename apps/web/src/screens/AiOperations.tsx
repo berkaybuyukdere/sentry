@@ -82,9 +82,16 @@ function Desk() {
       : [],
     query: { enabled: !!depositWallet, refetchInterval: 15_000 },
   });
-  const tradingBal = twReads.data
-    ? Number(((twReads.data[0]?.result as bigint | undefined) ?? 0n) + ((twReads.data[1]?.result as bigint | undefined) ?? 0n)) / 1e6
-    : null;
+  const twUsdcBal = twReads.data ? Number((twReads.data[0]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
+  const twPusdBal = twReads.data ? Number((twReads.data[1]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
+  const tradingBal = twReads.data ? (twUsdcBal ?? 0) + (twPusdBal ?? 0) : null;
+  // CLOB v2 settles ONLY in pUSD — USDC.e sitting in the deposit wallet reads
+  // as spendable balance here (it's real money) but the exchange contract
+  // sees zero collateral until it's converted 1:1 on polymarket.com
+  // ("Balance migration" banner). Verified live 2026-07-13: pUSD carried a
+  // full allowance to the v2 exchange from setupTradingApprovals() while
+  // actual pUSD balance was $0 — every order bounced "balance: 0" regardless.
+  const needsPusdConversion = (twUsdcBal ?? 0) > 0.5 && (twPusdBal ?? 0) < 0.5;
 
   const linkTradingWallet = async () => {
     if (!walletClient || !address) return;
@@ -307,6 +314,22 @@ function Desk() {
                     <p className="mt-1 text-[9px] leading-relaxed text-faint">
                       V2 ORDERS EXECUTE FROM THIS WALLET — EOA FUNDS MUST BE DEPOSITED HERE FIRST.
                     </p>
+                    {needsPusdConversion && (
+                      <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">
+                        <p className="text-[9px] leading-relaxed text-warn2">
+                          {fmt.usd(twUsdcBal ?? 0, { compact: false })} SITS AS USDC.E — CLOB V2 SETTLES
+                          ONLY IN pUSD. ORDERS WILL BOUNCE ("BALANCE: 0") UNTIL CONVERTED 1:1.
+                        </p>
+                        <a
+                          href="https://polymarket.com"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="focus-outline mt-1 flex h-7 w-full items-center justify-center border border-warn/50 bg-warn/10 text-[9.5px] font-medium uppercase tracking-[0.1em] text-warn2 transition-colors hover:bg-warn/20"
+                        >
+                          CONVERT ON POLYMARKET.COM — SAME WALLET, "BALANCE MIGRATION"
+                        </a>
+                      </div>
+                    )}
                     {(prov.usdcBalance ?? 0) >= 0.5 && (
                       <button
                         onClick={depositToTrading}
