@@ -63,6 +63,12 @@ export const DEFAULT_RELAYER_V2: RelayerV2Key = {
   address: "0xd99b056b407e5acb19598cacb00cdcddd0d11827",
 };
 
+// Every relayer key this project has ever shipped as a default. When a
+// browser's persisted store still holds one of these (from before a key
+// rotation), it's stale operator config, not a user override — auto-upgrade
+// it to the current default instead of silently shadowing the fix forever.
+const RETIRED_RELAYER_KEYS = ["019f582d-ec01-7db3-b000-a801c73ce83e"];
+
 export const useApiAccess = create<ApiAccessState>()(
   persist(
     (set) => ({
@@ -79,11 +85,12 @@ export const useApiAccess = create<ApiAccessState>()(
       // defaults — trading requires builder auth to function at all
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<ApiAccessState>;
+        const relayerStale = p.relayerV2 && RETIRED_RELAYER_KEYS.includes(p.relayerV2.key);
         return {
           ...current,
           ...p,
           builder: p.builder ?? DEFAULT_BUILDER,
-          relayerV2: p.relayerV2 ?? DEFAULT_RELAYER_V2,
+          relayerV2: relayerStale ? DEFAULT_RELAYER_V2 : (p.relayerV2 ?? DEFAULT_RELAYER_V2),
         };
       },
     },
