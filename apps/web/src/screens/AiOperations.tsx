@@ -14,6 +14,7 @@ import { useSmartFlow } from "../lib/smartFlow";
 import { useNotifications } from "../lib/alerts";
 import { useProvision } from "../lib/trading/provision";
 import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/trading/v2client";
+import { signAndPlaceOrder, snapToTick } from "../lib/trading/orders";
 import { USDC, PUSD, LEGACY_DEPOSIT_WALLET } from "../lib/trading/constants";
 import {
   useAiDesk,
@@ -25,9 +26,10 @@ import {
   type DeskMode,
   type ExecutionMode,
   type PaperPosition,
+  type LiveExecution,
   type Tempo,
 } from "../lib/aiDesk";
-import { Panel, Btn, Tag, Metric, Empty, cx } from "../components/ui/primitives";
+import { Panel, Btn, Tag, Metric, Empty, LiveNum, cx } from "../components/ui/primitives";
 
 const DOMAINS = ["Politics", "Crypto", "Sports", "Economy", "Tech", "Culture"];
 
@@ -82,7 +84,7 @@ function Desk() {
           { address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [LEGACY_DEPOSIT_WALLET] },
         ]
       : [],
-    query: { enabled: !!depositWallet, refetchInterval: 15_000 },
+    query: { enabled: !!depositWallet, refetchInterval: 10_000 },
   });
   const twUsdcBal = twReads.data ? Number((twReads.data[0]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
   const twPusdBal = twReads.data ? Number((twReads.data[1]?.result as bigint | undefined) ?? 0n) / 1e6 : null;
@@ -183,6 +185,22 @@ function Desk() {
   const sessionPnl = equity - paper.startingCapital;
   const wins = paper.closed.filter((t) => t.pnl > 0).length;
   const targetProgress = Math.min(Math.max(sessionPnl / Math.max(config.targetProfitUsd, 1), 0), 1);
+
+  // LIVE mode — same KPI shape as PAPER, computed from real fills/marks
+  const accrue = useBilling((s) => s.accrue);
+  const liveDeployed = desk.liveExecuted.reduce((s, e) => s + e.costUsd, 0);
+  const liveUnrealized = desk.liveExecuted.reduce(
+    (s, e) => s + (markOf(e.tokenId, e.entryPrice) - e.entryPrice) * e.shares,
+    0,
+  );
+  const liveRealized = desk.liveClosed.reduce((s, t) => s + t.pnl, 0);
+  const liveWins = desk.liveClosed.filter((t) => t.pnl > 0).length;
+  const liveFeesPaid =
+    desk.liveExecuted.reduce((s, e) => s + e.feeUsd, 0) +
+    desk.liveClosed.reduce((s, t) => s + t.feeUsd + t.exitFee, 0);
+  const liveEquity = (tradingBal ?? 0) + liveDeployed + liveUnrealized;
+  const liveSessionPnl = desk.liveBaseline !== null ? liveEquity - desk.liveBaseline : liveRealized + liveUnrealized;
+  const liveTargetProgress = Math.min(Math.max(liveSessionPnl / Math.max(config.targetProfitUsd, 1), 0), 1);
   // live-derived envelope shown when FREE WILL is on — same math the engine
   // runs; in LIVE mode the bankroll is the wallet's real Polygon USDC.e
   const fwBase = paperMode
@@ -202,6 +220,40 @@ function Desk() {
       desk.paperClose(p.id, exitPrice, proceeds, exitFee, "MANUAL");
     } catch {
       /* book unavailable — retry */
+    }
+  };
+
+  const [closingLive, setClosingLive] = useState<string | null>(null);
+  const manualCloseLive = async (p: LiveExecution) => {
+    if (!walletClient || !address) return;
+    setClosingLive(p.decisionId);
+    try {
+      const book = await fetchOrderBook(p.tokenId);
+      const stats = bookStats(book);
+      const mark = stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : markOf(p.tokenId, p.entryPrice);
+      const price = Math.max(p.tickSize, mark * 0.98 - p.tickSize); // slippage-guarded sell bound
+      const res = await signAndPlaceOrder(walletClient, address, {
+        tokenId: p.tokenId,
+        side: "SELL",
+        price: snapToTick(price, p.tickSize),
+        shares: p.shares,
+        tickSize: p.tickSize,
+        negRisk: p.negRisk,
+        orderType: "FAK",
+      });
+      if (!res.success) {
+        notify({ kind: "SYSTEM", title: "MANUAL CLOSE FAILED", body: (res.errorMsg ?? "order rejected").slice(0, 160), href: "/ai" });
+        return;
+      }
+      const proceeds = Number(res.makingAmount ?? p.shares * mark);
+      const exitFeeQuote = billing("SIGNAL", proceeds);
+      desk.recordLiveClose(p.decisionId, mark, proceeds, exitFeeQuote.feeUsd, "MANUAL");
+      accrue(exitFeeQuote, { market: p.question, notionalUsd: proceeds });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      notify({ kind: "SYSTEM", title: "MANUAL CLOSE FAILED", body: msg.slice(0, 160), href: "/ai" });
+    } finally {
+      setClosingLive(null);
     }
   };
 
@@ -721,11 +773,46 @@ function Desk() {
               </div>
             </div>
           ) : (
-            <div className="grid grid-cols-4 gap-6">
-              <Metric label="LIVE EXECUTIONS" value={desk.liveExecuted.length} />
-              <Metric label="MAX POSITIONS" value={config.maxPositions} />
-              <Metric label="STAGING" value={config.mode} sub="ARM auto-stages; wallet signs" />
-              <Metric label="PROPOSALS PENDING" value={decisions.filter((d) => d.status === "PROPOSED").length} tone="accent" />
+            <div className="grid grid-cols-6 gap-6">
+              <Metric
+                label="WALLET EQUITY"
+                value={<LiveNum value={liveEquity} format={(v) => fmt.usd(v, { compact: false })} className="text-[17px]" />}
+                sub={depositWallet ? "cash + open marks" : "link trading wallet"}
+                tone={liveSessionPnl >= 0 ? "pos" : "neg"}
+              />
+              <Metric
+                label="CASH / DEPLOYED"
+                value={<LiveNum value={tradingBal ?? 0} format={(v) => `${fmt.usd(v)} / ${fmt.usd(liveDeployed)}`} className="text-[17px]" />}
+                sub={`${desk.liveExecuted.length}/${config.maxPositions} positions open`}
+              />
+              <Metric
+                label="REALIZED P&L"
+                value={<LiveNum value={liveRealized} format={(v) => fmt.usd(v, { sign: true, compact: false })} className="text-[17px]" />}
+                tone={liveRealized >= 0 ? "pos" : "neg"}
+                sub={`${desk.liveClosed.length} trades · ${desk.liveClosed.length ? Math.round((liveWins / desk.liveClosed.length) * 100) : 0}% win`}
+              />
+              <Metric
+                label="UNREALIZED"
+                value={<LiveNum value={liveUnrealized} format={(v) => fmt.usd(v, { sign: true, compact: false })} className="text-[17px]" />}
+                tone={liveUnrealized >= 0 ? "pos" : "neg"}
+                sub="live marks"
+              />
+              <Metric
+                label="FEES PAID (REAL)"
+                value={<LiveNum value={liveFeesPaid} format={(v) => fmt.usd(v, { compact: false })} className="text-[17px]" />}
+                sub={`at ${bpsPct(signalRate)} signal rate`}
+              />
+              <div className="flex flex-col gap-1">
+                <div className="label-faint">TARGET — {fmt.usd(config.targetProfitUsd)}</div>
+                <LiveNum
+                  value={liveSessionPnl}
+                  format={(v) => fmt.usd(v, { sign: true, compact: false })}
+                  className={cx("text-[17px] leading-none", liveSessionPnl >= 0 ? "text-pos" : "text-neg")}
+                />
+                <div className="h-[3px] w-full bg-raise3">
+                  <div className="h-full bg-pos/70 transition-[width] duration-700 ease-out" style={{ width: `${liveTargetProgress * 100}%` }} />
+                </div>
+              </div>
             </div>
           )}
           {(engaged || paper.active) && scan.scannedAt > 0 && (
@@ -799,6 +886,63 @@ function Desk() {
                           <td className="mono-num px-2 text-right text-[10px] text-faint">{fmt.timeAgo(p.ts)}</td>
                           <td className="px-2 text-right">
                             <Btn size="sm" variant="ghost" onClick={() => void manualClose(p)}>CLOSE</Btn>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </Panel>
+          )}
+
+          {/* open positions (live) */}
+          {!paperMode && (
+            <Panel className="col-span-3 border-0" title="OPEN POSITIONS — LIVE MARKS" pad={false}>
+              {!desk.liveExecuted.length ? (
+                <Empty
+                  label={engaged ? "SCANNING FOR ENTRIES" : "NO OPEN POSITIONS"}
+                  hint={engaged ? "ARM auto-stages the best qualifying proposal; your wallet signs each fill." : "Engage the desk in LIVE mode to begin."}
+                />
+              ) : (
+                <table className="w-full">
+                  <thead>
+                    <tr className="hairline-b">
+                      <th className="label-faint px-3 py-1.5 text-left font-medium">MARKET</th>
+                      <th className="label-faint px-2 py-1.5 text-left font-medium">SIDE</th>
+                      <th className="label-faint px-2 py-1.5 text-right font-medium">ENTRY → MARK</th>
+                      <th className="label-faint px-2 py-1.5 text-right font-medium">TP / SL</th>
+                      <th className="label-faint px-2 py-1.5 text-right font-medium">SIZE</th>
+                      <th className="label-faint px-2 py-1.5 text-right font-medium">P&L (LIVE)</th>
+                      <th className="label-faint px-2 py-1.5 text-right font-medium">AGE</th>
+                      <th className="w-20 px-2 py-1.5" />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {desk.liveExecuted.map((p) => {
+                      const mark = markOf(p.tokenId, p.entryPrice);
+                      const pnl = (mark - p.entryPrice) * p.shares;
+                      return (
+                        <tr key={p.decisionId} className="hairline-b h-10 row-hover">
+                          <td className="max-w-0 truncate px-3 text-[11.5px] text-text">
+                            <button onClick={() => navigate(`/market/${p.slug}`)} className="hover:text-accent2">{p.question}</button>
+                          </td>
+                          <td className="px-2 text-[10px] font-semibold text-pos">{p.outcome.toUpperCase()}</td>
+                          <td className="mono-num px-2 text-right text-[10.5px] text-dim">
+                            <LiveNum value={mark} format={(v) => `${(p.entryPrice * 100).toFixed(1)}¢ → ${(v * 100).toFixed(1)}¢`} />
+                          </td>
+                          <td className="mono-num px-2 text-right text-[10px] text-faint">
+                            {(p.tpPrice * 100).toFixed(0)} / {(p.slPrice * 100).toFixed(0)}
+                          </td>
+                          <td className="mono-num px-2 text-right text-[11px] text-text">{fmt.usd(p.costUsd)}</td>
+                          <td className={cx("mono-num px-2 text-right text-[11px]", pnl >= 0 ? "text-pos" : "text-neg")}>
+                            <LiveNum value={pnl} format={(v) => fmt.usd(v, { sign: true, compact: false })} />
+                          </td>
+                          <td className="mono-num px-2 text-right text-[10px] text-faint">{fmt.timeAgo(p.ts)}</td>
+                          <td className="px-2 text-right">
+                            <Btn size="sm" variant="ghost" disabled={closingLive === p.decisionId} onClick={() => void manualCloseLive(p)}>
+                              {closingLive === p.decisionId ? "CLOSING…" : "CLOSE"}
+                            </Btn>
                           </td>
                         </tr>
                       );
@@ -902,7 +1046,7 @@ function Desk() {
           </Panel>
 
           {/* session ledger */}
-          <Panel className="border-0" title={paperMode ? "SESSION LEDGER — CLOSED TRADES" : "LIVE EXECUTION LOG"} pad={false}>
+          <Panel className="border-0" title={paperMode ? "SESSION LEDGER — CLOSED TRADES" : "LIVE EXECUTION LOG — CLOSED TRADES"} pad={false}>
             {paperMode ? (
               !paper.closed.length ? (
                 <Empty label="NO CLOSED TRADES" hint="Exits fire on take-profit, stop-loss or time." />
@@ -928,25 +1072,27 @@ function Desk() {
                   ))}
                 </div>
               )
-            ) : !desk.liveExecuted.length ? (
-              <Empty label="NO LIVE EXECUTIONS" hint="Confirmed desk orders appear here." />
+            ) : !desk.liveClosed.length ? (
+              <Empty label="NO CLOSED TRADES" hint="Real fills settle here once TP, SL, time-exit or a manual close confirms." />
             ) : (
               <div className="flex max-h-[520px] flex-col overflow-y-auto">
-                {desk.liveExecuted.map((e) => {
-                  const mark = markOf(e.tokenId, e.entryPrice);
-                  const pnl = (mark - e.entryPrice) * e.shares;
-                  return (
-                    <Link key={e.decisionId + e.ts} to={`/market/${e.slug}`} className="hairline-b row-hover block px-3 py-2.5">
-                      <div className="line-clamp-1 text-[11px] text-text">{e.question}</div>
-                      <div className="mono-num mt-1 flex items-center gap-3 text-[10px]">
-                        <span className="text-dim">{e.outcome.toUpperCase()}</span>
-                        <span className="text-faint">{(e.entryPrice * 100).toFixed(1)}¢ → {(mark * 100).toFixed(1)}¢</span>
-                        <span className="text-text">{fmt.usd(e.usd)}</span>
-                        <span className={cx("ml-auto", pnl >= 0 ? "text-pos" : "text-neg")}>{fmt.usd(pnl, { sign: true, compact: false })}</span>
-                      </div>
-                    </Link>
-                  );
-                })}
+                {desk.liveClosed.map((t) => (
+                  <Link key={t.decisionId + t.closedTs} to={`/market/${t.slug}`} className="hairline-b row-hover block px-3 py-2.5">
+                    <div className="line-clamp-1 text-[11px] text-text">{t.question}</div>
+                    <div className="mono-num mt-1 flex items-center gap-2.5 text-[10px]">
+                      <Tag tone={t.reason === "TAKE_PROFIT" ? "pos" : t.reason === "STOP_LOSS" ? "neg" : "dim"}>
+                        {t.reason.replaceAll("_", " ")}
+                      </Tag>
+                      <span className="text-faint">
+                        {(t.entryPrice * 100).toFixed(1)}¢ → {(t.exitPrice * 100).toFixed(1)}¢
+                      </span>
+                      <span className="text-faint">{fmt.timeAgo(t.closedTs)} AGO</span>
+                      <span className={cx("ml-auto text-[11px]", t.pnl >= 0 ? "text-pos" : "text-neg")}>
+                        {fmt.usd(t.pnl, { sign: true, compact: false })}
+                      </span>
+                    </div>
+                  </Link>
+                ))}
               </div>
             )}
           </Panel>

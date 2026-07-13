@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useAccount, useReadContracts } from "wagmi";
+import { useAccount, useReadContracts, useWalletClient } from "wagmi";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import Anthropic from "@anthropic-ai/sdk";
@@ -26,6 +26,7 @@ import { useLiveRef, cryptoAlignment, type RefRow } from "./liveRef";
 import { useSmartFlow, type SmartBuy } from "./smartFlow";
 import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
 import { cachedDepositWallet } from "./trading/v2client";
+import { signAndPlaceOrder, snapToTick } from "./trading/orders";
 
 /**
  * AI OPERATIONS DESK — statistical engine v2.
@@ -184,6 +185,42 @@ const EMPTY_SCAN: ScanStats = {
   scannedAt: 0,
 };
 
+export interface LiveExecution {
+  decisionId: string;
+  ts: number;
+  slug: string;
+  question: string;
+  tokenId: string;
+  outcome: string;
+  entryPrice: number;
+  usd: number;
+  shares: number;
+  tickSize: number;
+  negRisk: boolean;
+  costUsd: number;
+  feeUsd: number;
+  tpPrice: number;
+  slPrice: number;
+  deadline: number; // unix seconds
+}
+
+export interface LiveClosedTrade {
+  decisionId: string;
+  ts: number;
+  slug: string;
+  question: string;
+  outcome: string;
+  entryPrice: number;
+  exitPrice: number;
+  shares: number;
+  costUsd: number;
+  feeUsd: number;
+  exitFee: number;
+  pnl: number;
+  reason: "TAKE_PROFIT" | "STOP_LOSS" | "TIME_EXIT" | "MANUAL";
+  closedTs: number;
+}
+
 interface DeskState {
   config: DeskConfig;
   engaged: boolean;
@@ -193,7 +230,8 @@ interface DeskState {
   aiStatus: string | null;
   paper: PaperSession;
   scan: ScanStats;
-  liveExecuted: { decisionId: string; ts: number; slug: string; question: string; tokenId: string; outcome: string; entryPrice: number; usd: number; shares: number }[];
+  liveExecuted: LiveExecution[];
+  liveClosed: LiveClosedTrade[];
   setConfig: (patch: Partial<DeskConfig>) => void;
   setTempo: (t: Tempo) => void;
   setEngaged: (v: boolean) => void;
@@ -202,7 +240,8 @@ interface DeskState {
   replaceProposals: (d: DeskDecision[], scan: ScanStats) => void;
   setDecisionStatus: (id: string, status: DeskDecision["status"]) => void;
   applyAiVerdicts: (verdicts: { id: string; go: boolean; note: string }[]) => void;
-  recordLiveExecution: (r: DeskState["liveExecuted"][number]) => void;
+  recordLiveExecution: (r: LiveExecution) => void;
+  recordLiveClose: (decisionId: string, exitPrice: number, proceeds: number, exitFee: number, reason: LiveClosedTrade["reason"]) => void;
   startPaperSession: () => void;
   stopPaperSession: () => void;
   paperOpen: (p: PaperPosition) => void;
@@ -301,6 +340,7 @@ export const useAiDesk = create<DeskState>()(
       paper: EMPTY_PAPER,
       scan: EMPTY_SCAN,
       liveExecuted: [],
+      liveClosed: [],
 
       setConfig: (patch) => set((s) => ({ config: { ...s.config, ...patch } })),
       setTempo: (tempo) =>
@@ -355,6 +395,33 @@ export const useAiDesk = create<DeskState>()(
           liveExecuted: [r, ...s.liveExecuted].slice(0, 100),
           decisions: s.decisions.map((d) => (d.id === r.decisionId ? { ...d, status: "EXECUTED" } : d)),
         })),
+
+      recordLiveClose: (decisionId, exitPrice, proceeds, exitFee, reason) =>
+        set((s) => {
+          const pos = s.liveExecuted.find((e) => e.decisionId === decisionId);
+          if (!pos) return s;
+          const pnl = proceeds - exitFee - pos.costUsd - pos.feeUsd;
+          const trade: LiveClosedTrade = {
+            decisionId,
+            ts: pos.ts,
+            slug: pos.slug,
+            question: pos.question,
+            outcome: pos.outcome,
+            entryPrice: pos.entryPrice,
+            exitPrice,
+            shares: pos.shares,
+            costUsd: pos.costUsd,
+            feeUsd: pos.feeUsd,
+            exitFee,
+            pnl,
+            reason,
+            closedTs: Math.floor(Date.now() / 1000),
+          };
+          return {
+            liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
+            liveClosed: [trade, ...s.liveClosed].slice(0, 100),
+          };
+        }),
 
       startPaperSession: () =>
         set((s) => ({
@@ -422,7 +489,7 @@ export const useAiDesk = create<DeskState>()(
     }),
     {
       name: "sentry.aiDesk",
-      partialize: (s) => ({ config: s.config, paper: s.paper, liveExecuted: s.liveExecuted.slice(0, 40) }),
+      partialize: (s) => ({ config: s.config, paper: s.paper, liveExecuted: s.liveExecuted.slice(0, 40), liveClosed: s.liveClosed.slice(0, 40) }),
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<DeskState>;
         const paper = { ...EMPTY_PAPER, ...(p.paper ?? {}) };
@@ -433,6 +500,7 @@ export const useAiDesk = create<DeskState>()(
           paper,
           scan: EMPTY_SCAN,
           liveExecuted: p.liveExecuted ?? [],
+          liveClosed: p.liveClosed ?? [],
           // an active paper session resumes fully autonomous after reload
           engaged: paper.active,
         };
@@ -950,7 +1018,7 @@ export function useAiDeskEngine() {
           { address: PUSD, abi: ERC20_ABI, functionName: "balanceOf", args: [liveTarget] },
         ]
       : [],
-    query: { enabled: config.executionMode === "LIVE" && !!liveTarget, refetchInterval: 15_000 },
+    query: { enabled: config.executionMode === "LIVE" && !!liveTarget, refetchInterval: 10_000 },
   });
   const liveUsdc =
     liveBalRaw && (liveBalRaw[0]?.result !== undefined || liveBalRaw[1]?.result !== undefined)
@@ -1287,6 +1355,9 @@ export function useAiDeskEngine() {
     for (const d of staged) {
       const match = orders.find((o) => o.slug === d.slug && !o.error && Date.now() - o.ts < 5 * 60_000);
       if (match) {
+        const market = universe?.find((m) => m.slug === d.slug);
+        const entryMid = match.price;
+        const feeQuote = quote("SIGNAL", match.usd);
         desk.recordLiveExecution({
           decisionId: d.id,
           ts: Math.floor(match.ts / 1000),
@@ -1297,10 +1368,99 @@ export function useAiDeskEngine() {
           entryPrice: match.price,
           usd: match.usd,
           shares: match.shares,
+          tickSize: market?.tickSize ?? 0.01,
+          negRisk: market?.negRisk ?? false,
+          costUsd: match.usd,
+          feeUsd: feeQuote.feeUsd,
+          tpPrice: Math.min(0.99, entryMid * (1 + d.tpFrac)),
+          slPrice: Math.max(0.01, entryMid * (1 - d.slFrac)),
+          deadline: Math.floor(Date.now() / 1000) + effCfg.maxHoldMin * 60,
         });
-        accrue(quote("SIGNAL", match.usd), { market: d.question, notionalUsd: match.usd });
+        accrue(feeQuote, { market: d.question, notionalUsd: match.usd });
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orders, decisions]);
+
+  // ---- LIVE: exit management (TP / SL / time) — real SELL orders through the
+  // official v2 client. Runs while any live position is open, independent of
+  // `engaged`, so a stood-down desk never leaves a real position unmanaged.
+  // Mirrors the PAPER exit tick's safeguards exactly: marks come from the
+  // live book (not a stale WS quote), SL needs 2 consecutive breaching ticks,
+  // and a "take profit" is verified against the actual bid-side sell before
+  // it's allowed to close — a mid that ran ahead of exit liquidity holds.
+  const { data: liveWalletClient } = useWalletClient();
+  const liveClosing = useRef(false);
+  const liveSlBreach = useRef(new Map<string, number>());
+  useEffect(() => {
+    if (config.executionMode !== "LIVE" || !desk.liveExecuted.length || !liveWalletClient || !liveAddress) return;
+    const tick = async () => {
+      if (liveClosing.current) return;
+      liveClosing.current = true;
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const open = useAiDesk.getState().liveExecuted;
+        for (const p of open) {
+          try {
+            const book = await fetchOrderBook(p.tokenId);
+            const stats = bookStats(book);
+            const mark =
+              stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : p.entryPrice;
+            const hitTp = mark >= p.tpPrice;
+            const hitTime = now >= p.deadline;
+            let hitSl = false;
+            if (mark <= p.slPrice) {
+              const n = (liveSlBreach.current.get(p.decisionId) ?? 0) + 1;
+              liveSlBreach.current.set(p.decisionId, n);
+              hitSl = n >= 2;
+            } else {
+              liveSlBreach.current.delete(p.decisionId);
+            }
+            if (!hitTp && !hitSl && !hitTime) continue;
+            // verified-real TP: only close if selling into the ACTUAL bids
+            // nets a profit; otherwise hold (SL/deadline still guard downside)
+            if (hitTp && !hitSl && !hitTime) {
+              const preview = estimateSell(stats.bids, p.shares);
+              const previewProceeds = preview.filledShares > 0 ? preview.proceedsUsd : mark * p.shares;
+              const previewFee = quote("SIGNAL", previewProceeds).feeUsd;
+              if (previewProceeds - previewFee - p.costUsd - p.feeUsd <= 0) continue;
+            }
+            const price = Math.max(p.tickSize, mark * 0.98 - p.tickSize); // slippage-guarded sell bound
+            const snapped = snapToTick(price, p.tickSize);
+            const res = await signAndPlaceOrder(liveWalletClient, liveAddress, {
+              tokenId: p.tokenId,
+              side: "SELL",
+              price: snapped,
+              shares: p.shares,
+              tickSize: p.tickSize,
+              negRisk: p.negRisk,
+              orderType: "FAK",
+            });
+            if (!res.success) continue; // retry next tick
+            const proceeds = Number(res.makingAmount ?? p.shares * mark);
+            const exitFeeQuote = quote("SIGNAL", proceeds);
+            const reason = hitTp && !hitSl ? "TAKE_PROFIT" : hitSl ? "STOP_LOSS" : "TIME_EXIT";
+            liveSlBreach.current.delete(p.decisionId);
+            desk.recordLiveClose(p.decisionId, mark, proceeds, exitFeeQuote.feeUsd, reason);
+            accrue(exitFeeQuote, { market: p.question, notionalUsd: proceeds });
+            const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd - p.feeUsd;
+            notify({
+              kind: "ORDER",
+              title: `AI DESK — LIVE ${reason.replaceAll("_", " ")}`,
+              body: `${p.question.slice(0, 56)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} net`,
+              href: "/ai",
+            });
+          } catch {
+            /* book/order fault — retry next tick */
+          }
+        }
+      } finally {
+        liveClosing.current = false;
+      }
+    };
+    const t = setInterval(() => void tick(), 5_000);
+    void tick();
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.executionMode, desk.liveExecuted.length, liveWalletClient, liveAddress]);
 }
