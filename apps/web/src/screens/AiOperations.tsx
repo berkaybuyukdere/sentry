@@ -93,7 +93,11 @@ function Desk() {
       await getV2Client(walletClient, address);
       notify({ kind: "SYSTEM", title: "TRADING WALLET LINKED", body: "Deposit wallet derived — fund it to trade.", href: "/ai" });
     } catch (e) {
-      notify({ kind: "SYSTEM", title: "TRADING WALLET LINK FAILED", body: e instanceof Error ? e.message.slice(0, 100) : "unknown", href: "/ai" });
+      // full detail to console (debugFetch also prints the raw server body for
+      // clob.polymarket.com/auth* and relayer-v2 calls made during this step)
+      console.error("[SENTRY] linkTradingWallet failed:", e);
+      const msg = e instanceof Error ? e.message : String(e);
+      notify({ kind: "SYSTEM", title: "TRADING WALLET LINK FAILED", body: msg.slice(0, 200), href: "/ai" });
     } finally {
       setLinking(false);
     }

@@ -54,9 +54,13 @@ export const DEFAULT_BUILDER: BuilderKey = {
   signerAddress: "0xf39532def06c25b87d1f77192c91aca5dca54264",
 };
 
+// Bound to the OPERATOR'S OWN trading EOA (0xd99b...1827) — the prior key
+// was bound to a different signer address and got "from 0x… does not match
+// auth 0x…" on every relayer submit. A relayer key can only act for its own
+// bound address, so this one must match whichever wallet is connected.
 export const DEFAULT_RELAYER_V2: RelayerV2Key = {
-  key: "019f582d-ec01-7db3-b000-a801c73ce83e",
-  address: "0x1a5b883cb87b1213f09a3d95fd0c8e051f1c3505",
+  key: "019f5a02-3fb9-7828-ab5e-baba4eba9a57",
+  address: "0xd99b056b407e5acb19598cacb00cdcddd0d11827",
 };
 
 export const useApiAccess = create<ApiAccessState>()(

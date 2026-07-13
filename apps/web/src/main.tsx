@@ -5,10 +5,12 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { WagmiProvider } from "wagmi";
 import { wagmiConfig } from "./lib/wagmi";
 import { initTheme } from "./lib/theme";
+import { installDebugFetch } from "./lib/debugFetch";
 import App from "./App";
 import "./styles/app.css";
 
 initTheme();
+installDebugFetch();
 
 const queryClient = new QueryClient({
   defaultOptions: {
