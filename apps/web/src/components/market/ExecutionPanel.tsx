@@ -16,6 +16,7 @@ import { useOrderLog } from "../../lib/trading/orderLog";
 import { useNotifications } from "../../lib/alerts";
 import { useBilling, bpsPct } from "../../lib/billing";
 import { useAiDesk } from "../../lib/aiDesk";
+import { sendLiveMail } from "../../lib/liveMail";
 import { Btn, Tag, cx } from "../ui/primitives";
 import { WalletModal } from "../shell/WalletModal";
 
@@ -127,6 +128,12 @@ export function ExecutionPanel() {
         title: "ARM PAUSED — EXECUTION CONFIG FAULT",
         body: error.slice(0, 120),
         href: "/ai",
+      });
+      sendLiveMail({
+        kind: "FAULT",
+        key: `fault:${error.slice(0, 60)}`,
+        title: "ARM PAUSED — EXECUTION CONFIG FAULT",
+        detail: `Autopilot dropped to ADVISE after an unrecoverable execution fault: ${error.slice(0, 160)}`,
       });
     }
     const t = setTimeout(close, phase === "done" ? 1500 : 2500);

@@ -15,6 +15,7 @@ import { useNotifications } from "../lib/alerts";
 import { useProvision } from "../lib/trading/provision";
 import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/trading/v2client";
 import { signAndPlaceOrder, snapToTick } from "../lib/trading/orders";
+import { sendLiveMail } from "../lib/liveMail";
 import { USDC, PUSD, LEGACY_DEPOSIT_WALLET } from "../lib/trading/constants";
 import {
   useAiDesk,
@@ -249,6 +250,20 @@ function Desk() {
       const exitFeeQuote = billing("SIGNAL", proceeds);
       desk.recordLiveClose(p.decisionId, mark, proceeds, exitFeeQuote.feeUsd, "MANUAL");
       accrue(exitFeeQuote, { market: p.question, notionalUsd: proceeds });
+      const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd - p.feeUsd;
+      sendLiveMail({
+        kind: "CLOSE",
+        key: `close:${p.decisionId}`,
+        title: `MANUAL CLOSE — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
+        detail: `${p.outcome.toUpperCase()} closed by operator at ${(mark * 100).toFixed(1)}¢ (entry ${(p.entryPrice * 100).toFixed(1)}¢).`,
+        market: p.question,
+        outcome: p.outcome,
+        entryPrice: p.entryPrice,
+        exitPrice: mark,
+        sizeUsd: p.costUsd,
+        pnlUsd: pnl,
+        reason: "MANUAL",
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       notify({ kind: "SYSTEM", title: "MANUAL CLOSE FAILED", body: msg.slice(0, 160), href: "/ai" });
@@ -812,6 +827,11 @@ function Desk() {
                 <div className="h-[3px] w-full bg-raise3">
                   <div className="h-full bg-pos/70 transition-[width] duration-700 ease-out" style={{ width: `${liveTargetProgress * 100}%` }} />
                 </div>
+                {desk.lockedProfitUsd > 0 && (
+                  <div className="text-[10px] leading-tight text-warn2">
+                    {fmt.usd(desk.lockedProfitUsd, { compact: false })} BANKED — UNTOUCHABLE
+                  </div>
+                )}
               </div>
             </div>
           )}

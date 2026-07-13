@@ -27,6 +27,7 @@ import { useSmartFlow, type SmartBuy } from "./smartFlow";
 import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
 import { cachedDepositWallet } from "./trading/v2client";
 import { signAndPlaceOrder, snapToTick } from "./trading/orders";
+import { sendLiveMail, type LiveMailKpi } from "./liveMail";
 
 /**
  * AI OPERATIONS DESK — statistical engine v2.
@@ -202,6 +203,11 @@ export interface LiveExecution {
   tpPrice: number;
   slPrice: number;
   deadline: number; // unix seconds
+  /** persisted before exit management existed; exits stay dormant until the
+   *  first live mark rebases TP/SL/deadline off REALITY, not the old entry */
+  migrated?: boolean;
+  /** unix seconds of the one-time rebase for migrated positions */
+  rebasedTs?: number;
 }
 
 export interface LiveClosedTrade {
@@ -226,6 +232,12 @@ interface DeskState {
   engaged: boolean;
   haltReason: string | null;
   liveBaseline: number | null; // wallet USDC.e at LIVE engage — target/loss anchor
+  /** Profit-lock ladder: banked LIVE profit (absolute $) the desk may never
+   *  re-risk. Raised as session P&L crosses 25/50/75% of target (locking half
+   *  of each rung); entries are cash-floored at baseline+locked and the desk
+   *  stands down if P&L falls back to the locked level — banked money stays
+   *  banked. Cleared with the baseline on stand-down. */
+  lockedProfitUsd: number;
   decisions: DeskDecision[];
   aiStatus: string | null;
   paper: PaperSession;
@@ -237,11 +249,15 @@ interface DeskState {
   setEngaged: (v: boolean) => void;
   setHalt: (reason: string) => void;
   setLiveBaseline: (v: number | null) => void;
+  setLockedProfit: (v: number) => void;
   replaceProposals: (d: DeskDecision[], scan: ScanStats) => void;
   setDecisionStatus: (id: string, status: DeskDecision["status"]) => void;
   applyAiVerdicts: (verdicts: { id: string; go: boolean; note: string }[]) => void;
   recordLiveExecution: (r: LiveExecution) => void;
   recordLiveClose: (decisionId: string, exitPrice: number, proceeds: number, exitFee: number, reason: LiveClosedTrade["reason"]) => void;
+  /** one-time TP/SL/deadline rebase for migrated positions — persisted so it
+   *  survives reloads (merge-derived values alone never reach localStorage) */
+  rebaseLivePosition: (decisionId: string, patch: Partial<LiveExecution>) => void;
   startPaperSession: () => void;
   stopPaperSession: () => void;
   paperOpen: (p: PaperPosition) => void;
@@ -335,6 +351,7 @@ export const useAiDesk = create<DeskState>()(
       engaged: false,
       haltReason: null,
       liveBaseline: null,
+      lockedProfitUsd: 0,
       decisions: [],
       aiStatus: null,
       paper: EMPTY_PAPER,
@@ -357,6 +374,7 @@ export const useAiDesk = create<DeskState>()(
       setEngaged: (engaged) => set((s) => ({ engaged, haltReason: engaged ? null : s.haltReason })),
       setHalt: (haltReason) => set({ haltReason, engaged: false }),
       setLiveBaseline: (liveBaseline) => set({ liveBaseline }),
+      setLockedProfit: (lockedProfitUsd) => set({ lockedProfitUsd }),
 
       /** Fresh proposals rebuild the feed each sweep. Only STAGED rows (a live
        *  order awaiting the user's signature) are preserved; FILLED/closed/vetoed
@@ -394,6 +412,11 @@ export const useAiDesk = create<DeskState>()(
         set((s) => ({
           liveExecuted: [r, ...s.liveExecuted].slice(0, 100),
           decisions: s.decisions.map((d) => (d.id === r.decisionId ? { ...d, status: "EXECUTED" } : d)),
+        })),
+
+      rebaseLivePosition: (decisionId, patch) =>
+        set((s) => ({
+          liveExecuted: s.liveExecuted.map((e) => (e.decisionId === decisionId ? { ...e, ...patch } : e)),
         })),
 
       recordLiveClose: (decisionId, exitPrice, proceeds, exitFee, reason) =>
@@ -493,14 +516,38 @@ export const useAiDesk = create<DeskState>()(
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<DeskState>;
         const paper = { ...EMPTY_PAPER, ...(p.paper ?? {}) };
+        // migrate live positions persisted before exit management existed:
+        // they lack tp/sl/deadline/cost fields, which would render as NaN in
+        // the KPIs and make the exit tick silently skip them. CRITICAL: do NOT
+        // stamp live triggers here — an entry-anchored SL on an aged position
+        // that has already drifted >slPct fires within seconds of load, and a
+        // shared deadline mass-dumps the whole book minutes later (adversarial
+        // review caught exactly this against 9 real open positions). Instead:
+        // TP is entry-anchored (harmless — TP only closes after a verified
+        // net-positive sell), SL is parked at the 1¢ floor (dormant) and the
+        // deadline far out; the exit tick REBASES both off the first real
+        // mark it sees and persists that via rebaseLivePosition.
+        const tempo = TEMPO_PARAMS[p.config?.tempo ?? DEFAULT_CONFIG.tempo];
+        const liveExecuted = (p.liveExecuted ?? []).map((e) => ({
+          ...e,
+          tickSize: e.tickSize ?? 0.01,
+          negRisk: e.negRisk ?? false,
+          costUsd: e.costUsd ?? e.usd,
+          feeUsd: e.feeUsd ?? 0,
+          tpPrice: e.tpPrice ?? Math.min(0.99, e.entryPrice * (1 + tempo.tpPct / 100)),
+          slPrice: e.slPrice ?? 0.01,
+          deadline: e.deadline ?? Math.floor(Date.now() / 1000) + 24 * 3600,
+          migrated: e.migrated ?? (e.tpPrice === undefined),
+        }));
         return {
           ...current,
           ...p,
           config: { ...DEFAULT_CONFIG, ...(p.config ?? {}) },
           paper,
           scan: EMPTY_SCAN,
-          liveExecuted: p.liveExecuted ?? [],
+          liveExecuted,
           liveClosed: p.liveClosed ?? [],
+          lockedProfitUsd: 0, // session-scoped; a reload stands the desk down
           // an active paper session resumes fully autonomous after reload
           engaged: paper.active,
         };
@@ -1011,7 +1058,7 @@ export function useAiDeskEngine() {
   // (USDC.e + pUSD, the v2 collateral) instead of the EOA's
   const { address: liveAddress } = useAccount();
   const liveTarget = liveAddress ? (cachedDepositWallet(liveAddress) ?? liveAddress) : undefined;
-  const { data: liveBalRaw } = useReadContracts({
+  const { data: liveBalRaw, dataUpdatedAt: liveBalAsOf } = useReadContracts({
     contracts: liveTarget
       ? [
           { address: USDC, abi: ERC20_ABI, functionName: "balanceOf", args: [liveTarget] },
@@ -1024,6 +1071,35 @@ export function useAiDeskEngine() {
     liveBalRaw && (liveBalRaw[0]?.result !== undefined || liveBalRaw[1]?.result !== undefined)
       ? Number(((liveBalRaw[0]?.result as bigint | undefined) ?? 0n) + ((liveBalRaw[1]?.result as bigint | undefined) ?? 0n)) / 1e6
       : null;
+  // the poll is 10s-stale: fills recorded since the last balance read have
+  // spent cash the snapshot still shows. Every gate/sizing decision uses this
+  // corrected figure — back-to-back ARM fills inside one poll window were
+  // able to spend straight through the profit-lock floor otherwise.
+  const pendingSpend = desk.liveExecuted
+    .filter((e) => e.ts * 1000 > (liveBalAsOf ?? 0) - 2_000)
+    .reduce((s, e) => s + e.costUsd, 0);
+  const liveCash = liveUsdc !== null ? Math.max(0, liveUsdc - pendingSpend) : null;
+
+  // KPI snapshot attached to every live e-mail — store reads are fresh by
+  // nature; the wallet figure goes through a ref updated every render so a
+  // long-lived effect closure (the 5s exit tick) never reports a frozen value
+  const liveCashRef = useRef<number | null>(null);
+  liveCashRef.current = liveCash;
+  const liveMailKpi = (): LiveMailKpi => {
+    const st = useAiDesk.getState();
+    const cash = liveCashRef.current;
+    return {
+      walletUsd: cash,
+      openCount: st.liveExecuted.length,
+      realizedUsd: st.liveClosed.reduce((s, t) => s + t.pnl, 0),
+      lockedUsd: st.lockedProfitUsd,
+      targetUsd: st.config.targetProfitUsd,
+      sessionPnlUsd:
+        st.liveBaseline !== null && cash !== null
+          ? cash + st.liveExecuted.reduce((s, e) => s + e.costUsd, 0) - st.liveBaseline
+          : null,
+    };
+  };
 
   useEffect(() => {
     startLiveRef();
@@ -1053,11 +1129,23 @@ export function useAiDeskEngine() {
     return fallback;
   };
 
-  // effective config: FREE WILL derives all sizing/risk knobs from live equity
+  // effective config: FREE WILL derives all sizing/risk knobs from live equity.
+  // Profit-lock model (LIVE): the cash floor is baseline + locked — the original
+  // bank AND every banked dollar are untouchable. While a lock is active the
+  // desk sizes and spends ONLY from cash above that floor ("play with half the
+  // profit, bank the other half"); with no lock the whole bank plays as before.
+  // FAIL CLOSED: if the balance feed drops while a lock is active, playable
+  // is 0 — never fall back to budgetUsd with banked profit on the line.
+  const locked = desk.lockedProfitUsd;
+  const liveCashFloor = locked > 0 && desk.liveBaseline !== null ? desk.liveBaseline + locked : null;
+  const livePlayable =
+    liveCashFloor !== null
+      ? liveCash !== null
+        ? Math.max(0, Math.min(liveCash - liveCashFloor, config.budgetUsd))
+        : 0
+      : Math.min(liveCash ?? config.budgetUsd, config.budgetUsd);
   const liveEquity =
-    config.executionMode === "PAPER" && paper.active
-      ? paperEquity(paper, markOf)
-      : Math.min(liveUsdc ?? config.budgetUsd, config.budgetUsd);
+    config.executionMode === "PAPER" && paper.active ? paperEquity(paper, markOf) : livePlayable;
   const effCfg = effectiveDeskConfig(config, liveEquity, paper.startingCapital || config.startingCapitalUsd);
 
   // ---- statistical sweep ----------------------------------------------------
@@ -1083,9 +1171,14 @@ export function useAiDeskEngine() {
         return d?.eventSlug ?? "";
       }).filter(Boolean),
     );
+    const floor = st.lockedProfitUsd > 0 && st.liveBaseline !== null ? st.liveBaseline + st.lockedProfitUsd : null;
     const equity = config.executionMode === "PAPER" && st.paper.active
       ? paperEquity(st.paper, markOf)
-      : Math.min(liveUsdc ?? config.budgetUsd, config.budgetUsd);
+      : floor !== null
+        ? liveCash !== null
+          ? Math.max(0, Math.min(liveCash - floor, config.budgetUsd))
+          : 0 // fail closed under an active lock
+        : Math.min(liveCash ?? config.budgetUsd, config.budgetUsd);
     const openSlots = Math.max(0, effCfg.maxPositions - (config.executionMode === "PAPER" ? st.paper.positions.length : st.liveExecuted.length));
     const { decisions: fresh, scan } = sweepUniverse(
       universe, signals, tape, effCfg, billingTierRateBps, equity, exclude, excludeEvents, openSlots, cryptoRows, smartBuys,
@@ -1299,26 +1392,61 @@ export function useAiDeskEngine() {
         desk.setHalt(`LOSS BRAKE — $${pnl.toFixed(2)} (LIMIT $${effCfg.maxLossUsd}) · DESK STANDBY`);
       }
     }
-    if (config.executionMode === "LIVE" && desk.liveBaseline !== null && liveUsdc !== null) {
-      const pnl = liveUsdc - desk.liveBaseline;
+    if (config.executionMode === "LIVE" && desk.liveBaseline !== null && liveCash !== null) {
+      // cost-basis equity delta: cash + open-position cost vs the same sum at
+      // engage. Entries move cash into cost basis (P&L unchanged); each close
+      // moves realized P&L only. Raw cash delta would read every deployment
+      // as a loss and every returning principal as profit. liveCash (pending-
+      // spend-corrected) keeps a just-filled entry from inflating P&L for the
+      // ~10s until the balance poll catches up.
+      const openCost = desk.liveExecuted.reduce((s, e) => s + e.costUsd, 0);
+      const pnl = liveCash + openCost - desk.liveBaseline;
       if (pnl >= config.targetProfitUsd) {
         desk.setHalt(`TARGET REACHED — +$${pnl.toFixed(2)} LIVE (WALLET-MEASURED) · DESK STANDBY`);
         notify({ kind: "SYSTEM", title: "AI DESK — LIVE TARGET REACHED", body: `Wallet is up $${pnl.toFixed(2)} since engage.`, href: "/ai" });
+        sendLiveMail({ kind: "TARGET", key: `target:${desk.liveBaseline}`, title: "TARGET REACHED", detail: `Wallet up $${pnl.toFixed(2)} since engage — desk standing down.`, kpi: liveMailKpi() });
       } else if (pnl <= -effCfg.maxLossUsd) {
         desk.setHalt(`LOSS BRAKE — $${pnl.toFixed(2)} LIVE (LIMIT $${effCfg.maxLossUsd}) · DESK STANDBY`);
+        sendLiveMail({ kind: "LOSS_BRAKE", key: `brake:${desk.liveBaseline}`, title: "LOSS BRAKE", detail: `Session P&L $${pnl.toFixed(2)} hit the -$${effCfg.maxLossUsd} brake — desk standing down. Open positions remain exit-managed.`, kpi: liveMailKpi() });
+      } else {
+        // profit-lock ladder: crossing 25/50/75% of target banks half the rung.
+        // e.g. target $500 → at +$250 lock $125 (play on with $125, $125 safe).
+        // P&L here is wallet-cash delta, so a rung only triggers on money that
+        // actually came back to the wallet — never on paper marks. The floor
+        // itself is enforced by the ARM entry gate (cash can never be spent
+        // below baseline+locked) and exits only ever ADD cash, so no separate
+        // halt is needed: the banked amount is mathematically unreachable.
+        for (const f of [0.75, 0.5, 0.25]) {
+          const rung = config.targetProfitUsd * f;
+          const lockTo = Math.round((rung / 2) * 100) / 100;
+          if (pnl >= rung && desk.lockedProfitUsd < lockTo) {
+            desk.setLockedProfit(lockTo);
+            notify({ kind: "SYSTEM", title: "AI DESK — PROFIT LOCKED", body: `+$${pnl.toFixed(2)} reached ${Math.round(f * 100)}% of target — $${lockTo.toFixed(2)} banked, playing on with the rest.`, href: "/ai" });
+            sendLiveMail({ kind: "LOCK", key: `lock:${desk.liveBaseline}:${f}`, title: `PROFIT LOCKED — $${lockTo.toFixed(2)} BANKED`, detail: `Session P&L +$${pnl.toFixed(2)} crossed ${Math.round(f * 100)}% of the $${config.targetProfitUsd} target. $${lockTo.toFixed(2)} is now untouchable; the desk plays on with cash above the floor only.`, kpi: liveMailKpi() });
+            break;
+          }
+        }
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engaged, paper, quotes, config, liveUsdc]);
 
   // LIVE baseline: wallet balance snapshot at engage; cleared on stand-down —
-  // the target is measured against REAL money, deposits mid-session skew it
+  // the target is measured against REAL money, deposits mid-session skew it.
+  // The profit lock lives and dies with the baseline: a fresh engage gets a
+  // fresh ladder (the previously banked cash is simply part of the new bank).
   useEffect(() => {
-    if (engaged && config.executionMode === "LIVE" && liveUsdc !== null && desk.liveBaseline === null) {
-      desk.setLiveBaseline(liveUsdc);
+    if (engaged && config.executionMode === "LIVE" && liveCash !== null && desk.liveBaseline === null) {
+      // anchor = cash + cost basis of already-open positions. Engaging (or
+      // re-engaging after a reload) with positions deployed must not count
+      // their returning principal as fresh profit — otherwise the ladder
+      // banks capital as if it were gains and the target fires spuriously.
+      const openCost = useAiDesk.getState().liveExecuted.reduce((s, e) => s + e.costUsd, 0);
+      desk.setLiveBaseline(liveCash + openCost);
     }
     if (!engaged && desk.liveBaseline !== null) {
       desk.setLiveBaseline(null);
+      if (desk.lockedProfitUsd !== 0) desk.setLockedProfit(0);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engaged, config.executionMode, liveUsdc]);
@@ -1329,7 +1457,13 @@ export function useAiDeskEngine() {
     if (desk.liveExecuted.length >= config.maxPositions) return;
     const next = decisions
       .filter((d) => d.status === "PROPOSED" && d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
-      .filter((d) => liveUsdc === null || d.sizeUsd <= liveUsdc)
+      // hard cash floor: with a profit lock active, an entry may only spend
+      // cash ABOVE baseline+locked, measured against the pending-spend-corrected
+      // balance. A dead balance feed fails CLOSED while a lock is active.
+      .filter((d) => {
+        if (liveCash === null) return liveCashFloor === null;
+        return d.sizeUsd <= (liveCashFloor !== null ? liveCash - liveCashFloor : liveCash);
+      })
       .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)[0];
     if (!next || !universe) return;
     const market = universe.find((m) => m.slug === next.slug);
@@ -1377,6 +1511,18 @@ export function useAiDeskEngine() {
           deadline: Math.floor(Date.now() / 1000) + effCfg.maxHoldMin * 60,
         });
         accrue(feeQuote, { market: d.question, notionalUsd: match.usd });
+        sendLiveMail({
+          kind: "ENTRY",
+          key: `entry:${d.id}`,
+          title: `LIVE ENTRY — BUY ${d.outcome.toUpperCase()} @ ${(match.price * 100).toFixed(1)}¢`,
+          detail: `$${match.usd.toFixed(2)} filled · TP ${(Math.min(0.99, entryMid * (1 + d.tpFrac)) * 100).toFixed(1)}¢ / SL ${(Math.max(0.01, entryMid * (1 - d.slFrac)) * 100).toFixed(1)}¢ · P(win) ${(d.pWin * 100).toFixed(0)}% · EV +${d.evCents.toFixed(2)}¢/sh`,
+          market: d.question,
+          outcome: d.outcome,
+          entryPrice: match.price,
+          sizeUsd: match.usd,
+          reasons: d.reasons.slice(0, 4),
+          kpi: liveMailKpi(),
+        });
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1406,6 +1552,22 @@ export function useAiDeskEngine() {
             const stats = bookStats(book);
             const mark =
               stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : p.entryPrice;
+            // migrated (pre-upgrade) position: rebase risk params off the
+            // FIRST real mark, then persist. SL anchors below where the
+            // position actually trades today — never below its long-gone
+            // entry, which would fire-sale aged drawdowns on sight. Deadlines
+            // stagger 30min apart so the book can never mass-dump at once.
+            if (p.migrated && !p.rebasedTs) {
+              if (stats.bestBid === null || stats.bestAsk === null) continue; // need a real book to rebase
+              const T = TEMPO_PARAMS[useAiDesk.getState().config.tempo];
+              desk.rebaseLivePosition(p.decisionId, {
+                slPrice: Math.max(0.01, mark * (1 - T.slPct / 100)),
+                tpPrice: Math.min(0.99, Math.max(p.tpPrice, mark * (1 + T.tpPct / 100))),
+                deadline: now + 24 * 3600 + open.indexOf(p) * 1800,
+                rebasedTs: now,
+              });
+              continue; // triggers evaluate from the next tick, on rebased values
+            }
             const hitTp = mark >= p.tpPrice;
             const hitTime = now >= p.deadline;
             let hitSl = false;
@@ -1425,15 +1587,20 @@ export function useAiDeskEngine() {
               const previewFee = quote("SIGNAL", previewProceeds).feeUsd;
               if (previewProceeds - previewFee - p.costUsd - p.feeUsd <= 0) continue;
             }
-            const price = Math.max(p.tickSize, mark * 0.98 - p.tickSize); // slippage-guarded sell bound
-            const snapped = snapToTick(price, p.tickSize);
+            // fresh universe row is ground truth for order params — the stored
+            // values may be migration defaults on pre-upgrade positions
+            const mkt = universe?.find((m) => m.slug === p.slug);
+            const tickSize = mkt?.tickSize ?? p.tickSize;
+            const negRisk = mkt?.negRisk ?? p.negRisk;
+            const price = Math.max(tickSize, mark * 0.98 - tickSize); // slippage-guarded sell bound
+            const snapped = snapToTick(price, tickSize);
             const res = await signAndPlaceOrder(liveWalletClient, liveAddress, {
               tokenId: p.tokenId,
               side: "SELL",
               price: snapped,
               shares: p.shares,
-              tickSize: p.tickSize,
-              negRisk: p.negRisk,
+              tickSize,
+              negRisk,
               orderType: "FAK",
             });
             if (!res.success) continue; // retry next tick
@@ -1449,6 +1616,20 @@ export function useAiDeskEngine() {
               title: `AI DESK — LIVE ${reason.replaceAll("_", " ")}`,
               body: `${p.question.slice(0, 56)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} net`,
               href: "/ai",
+            });
+            sendLiveMail({
+              kind: "CLOSE",
+              key: `close:${p.decisionId}`,
+              title: `${reason.replaceAll("_", " ")} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
+              detail: `${p.outcome.toUpperCase()} closed at ${(mark * 100).toFixed(1)}¢ (entry ${(p.entryPrice * 100).toFixed(1)}¢) for ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} after fees.`,
+              market: p.question,
+              outcome: p.outcome,
+              entryPrice: p.entryPrice,
+              exitPrice: mark,
+              sizeUsd: p.costUsd,
+              pnlUsd: pnl,
+              reason,
+              kpi: liveMailKpi(),
             });
           } catch {
             /* book/order fault — retry next tick */
