@@ -99,15 +99,29 @@ export async function signAndPlaceOrder(
     });
   };
 
+  const needsApprovalRepair = (r: unknown): boolean => {
+    const msg = (r as { errorMsg?: string } | undefined)?.errorMsg ?? "";
+    return /allowance|approv|balance/i.test(msg);
+  };
+
   let res: Awaited<ReturnType<typeof place>>;
   try {
     res = await place();
+    // The v2 exchange contract is DIFFERENT from the legacy CTF/neg-risk
+    // exchanges our old provisioning approved — a fresh Deposit Wallet has
+    // zero allowance against it, and the client reports this as a normal
+    // `{ok:false, errorMsg:"not enough balance / allowance…"}` RESULT rather
+    // than throwing, so a try/catch alone never sees it. Check the result too.
+    if (!(res as { ok?: boolean }).ok && needsApprovalRepair(res)) {
+      console.info("%c[SENTRY] deposit wallet lacks v2 exchange allowance — repairing via setupTradingApprovals()…", "color:#59f");
+      await client.setupTradingApprovals(); // wallet prompts for the real v2 exchange; waits for confirmation
+      res = await place();
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (/allowance|approv|balance/i.test(msg)) {
-      // V2 trading approvals differ from the legacy USDC.e grants — let the
-      // official client repair them (wallet prompts), then retry once
-      await client.setupTradingApprovals(); // waits for confirmation internally
+      // same repair path for the thrown-exception variant of this fault
+      await client.setupTradingApprovals();
       res = await place();
     } else {
       throw e;
