@@ -340,15 +340,16 @@ function Desk() {
                       </span>
                     </div>
                     <p className="mt-1 text-[9px] leading-relaxed text-faint">
-                      THIS IS POLYMARKET.COM'S OWN WALLET FOR YOUR ACCOUNT — DEPOSITS AND CASH ON
-                      THE SITE LIVE HERE, AND SENTRY NOW TRADES FROM THE SAME PLACE.
+                      CLOB V2 EXECUTES FROM YOUR POLYMARKET DEPOSIT WALLET, NOT THE EOA. THIS IS THE
+                      OFFICIAL CLIENT'S OWN SELF-DERIVED ADDRESS — NOTE: POLYMARKET.COM'S OWN "CASH"
+                      BALANCE MAY LIVE AT A DIFFERENT, WEBSITE-MANAGED ADDRESS AND NOT REFLECT THIS
+                      ONE. VERIFY ON POLYGONSCAN BEFORE MOVING LARGER AMOUNTS.
                     </p>
-                    {legacyBal > 0.5 && (
+                    {legacyBal > 0.5 && depositWallet?.toLowerCase() !== LEGACY_DEPOSIT_WALLET.toLowerCase() && (
                       <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">
                         <p className="text-[9px] leading-relaxed text-warn2">
-                          {fmt.usd(legacyBal, { compact: false })} IS STRANDED IN AN OLD SYSTEM WALLET
-                          ({LEGACY_DEPOSIT_WALLET.slice(0, 8)}…) — INVISIBLE TO POLYMARKET.COM. PULL IT
-                          BACK TO YOUR OWN WALLET, THEN DEPOSIT VIA THE SITE.
+                          {fmt.usd(legacyBal, { compact: false })} SITS IN A DIFFERENT SYSTEM WALLET
+                          ({LEGACY_DEPOSIT_WALLET.slice(0, 8)}…). PULL IT BACK TO YOUR OWN WALLET.
                         </p>
                         <button
                           onClick={recoverStranded}
