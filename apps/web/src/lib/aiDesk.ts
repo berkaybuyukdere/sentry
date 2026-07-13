@@ -235,6 +235,8 @@ export interface LiveClosedTrade {
   pnl: number;
   reason: "TAKE_PROFIT" | "STOP_LOSS" | "TIME_EXIT" | "MANUAL";
   closedTs: number;
+  /** lowercase EOA that owned the position — realized P&L is per-identity */
+  owner?: string;
 }
 
 interface DeskState {
@@ -454,6 +456,7 @@ export const useAiDesk = create<DeskState>()(
             pnl,
             reason,
             closedTs: Math.floor(Date.now() / 1000),
+            owner: pos.owner,
           };
           return {
             liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
@@ -483,6 +486,7 @@ export const useAiDesk = create<DeskState>()(
             pnl: proceeds - exitFee - costSlice - feeSlice,
             reason,
             closedTs: Math.floor(Date.now() / 1000),
+            owner: pos.owner,
           };
           const remainder = pos.shares - filledShares;
           return {
@@ -1097,6 +1101,7 @@ export function useAiDeskEngine() {
   const stage = useTicket((s) => s.stage);
   const ticketOpen = useTicket((s) => s.open);
   const orders = useOrderLog((s) => s.orders);
+  const logOrder = useOrderLog((s) => s.log);
 
   const opening = useRef(false);
   const closing = useRef(false);
@@ -1544,8 +1549,13 @@ export function useAiDeskEngine() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [engaged, config.executionMode, liveUsdc]);
 
-  // ---- LIVE: ARM auto-staging + order-log linking ---------------------------
+  // ---- LIVE: ARM auto-staging (PHANTOM-manual path only) --------------------
+  // When the autopilot session signer is armed, the FAST direct-fill effect
+  // below owns entries (PAPER-speed, multi-fill, no ticket). This slow
+  // one-at-a-time ticket path only runs for the Phantom-signed manual case,
+  // where each order legitimately needs its own wallet prompt.
   useEffect(() => {
+    if (autoOn) return; // fast path owns entries when armed
     if (!engaged || config.executionMode !== "LIVE" || config.mode !== "ARM" || ticketOpen) return;
     if (desk.liveExecuted.filter(ownedByLive).length >= config.maxPositions) return;
     const next = decisions
@@ -1569,7 +1579,190 @@ export function useAiDeskEngine() {
     }, 1200);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [engaged, config, ticketOpen, decisions, universe]);
+  }, [engaged, config, ticketOpen, decisions, universe, autoOn]);
+
+  // ---- LIVE: FAST autopilot entries (session-signed, PAPER-speed) -----------
+  // Mirrors the PAPER opener exactly — multi-fill per sweep against the real
+  // book, depth-clipped, walk-guarded — but places REAL BUY orders signed
+  // silently by the session key. No ticket, no per-order prompt, no 1.2s
+  // stage delay. Only runs when the autopilot signer is armed.
+  const liveOpening = useRef(false);
+  useEffect(() => {
+    if (!autoOn || !engaged || config.executionMode !== "LIVE" || config.mode !== "ARM") return;
+    if (liveOpening.current || liveClosing.current) return;
+    const wClient = sessionWalletClient();
+    const wAddr = sessionAddress();
+    if (!wClient || !wAddr || liveCash === null) return; // fail closed on unknown balance
+    const owned = desk.liveExecuted.filter(ownedByLive);
+    const slots = effCfg.maxPositions - owned.length;
+    if (slots <= 0) return;
+    // spendable = cash above the profit-lock floor; the ladder caps how much
+    // of the bank may be in the market at once (expands as profit accrues)
+    const spendableCash = liveCashFloor !== null ? liveCash - liveCashFloor : liveCash;
+    if (spendableCash < effCfg.minTradeUsd) return;
+    const baseline = desk.liveBaseline ?? liveCash;
+    // ownerless legacy trades belong to Phantom (mirror ownerOf), NOT the
+    // session identity — attributing them to a burner would skew its ladder
+    const realizedOwned = desk.liveClosed
+      .filter((t) => (t.owner ?? phantomAddress?.toLowerCase()) === wAddr.toLowerCase())
+      .reduce((s, t) => s + t.pnl, 0);
+    const capFrac = deployCapFrac(realizedOwned, Math.max(baseline, 1));
+    const deployedCost = owned.reduce((s, e) => s + e.costUsd, 0);
+    const ladderUsd = Math.max(capFrac * baseline, Math.min(2 * effCfg.minTradeUsd, 0.5 * baseline));
+    let headroom = Math.min(ladderUsd - deployedCost, spendableCash);
+    if (headroom < effCfg.minTradeUsd) return;
+    const perCycle = realizedOwned < -0.02 * baseline ? Math.max(1, Math.floor(tempo.entriesPerCycle / 2)) : tempo.entriesPerCycle;
+    const openSlugs = new Set(owned.map((e) => e.slug));
+    const batch = decisions
+      .filter((d) => d.status === "PROPOSED" && d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
+      .filter((d) => !openSlugs.has(d.slug)) // never double-enter the same market
+      .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)
+      .slice(0, Math.min(perCycle, slots));
+    if (!batch.length) return;
+
+    liveOpening.current = true;
+    (async () => {
+      try {
+        let cashLeft = headroom;
+        for (const next of batch) {
+          if (cashLeft < effCfg.minTradeUsd) break;
+          const market = universe?.find((m) => m.slug === next.slug);
+          if (!market) continue;
+          try {
+            const book = await fetchOrderBook(next.tokenId);
+            const stats = bookStats(book);
+            // depth-aware sizing: only dollars fillable within 1% of best ask,
+            // and never more than half of that tight depth (thin-book markout)
+            let tightDepth = 0;
+            if (stats.bestAsk !== null) {
+              for (const lvl of stats.asks) {
+                if (lvl.price > stats.bestAsk * 1.01) break;
+                tightDepth += lvl.price * lvl.size;
+              }
+            }
+            const spend = Math.min(next.sizeUsd, cashLeft, headroom, tightDepth * 0.5);
+            if (spend < effCfg.minTradeUsd) {
+              useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              continue;
+            }
+            const fill = estimateFill(stats.asks, spend);
+            const askRef = stats.bestAsk ?? fill.avgPrice;
+            // walk guard: never pay >1% above the QUOTED best ask
+            if (fill.shares <= 0 || fill.avgPrice <= 0 || fill.avgPrice > askRef * 1.01) {
+              useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              continue;
+            }
+            const tick = market.tickSize;
+            const limit = snapToTick(Math.min(1 - tick, fill.avgPrice * 1.02 + tick), tick);
+            const shares = Math.floor((spend / limit) * 100) / 100;
+            if (shares < 0.01) {
+              useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              continue;
+            }
+            const res = await signAndPlaceOrder(wClient, wAddr, {
+              tokenId: next.tokenId,
+              side: "BUY",
+              price: limit,
+              shares,
+              tickSize: tick,
+              negRisk: market.negRisk,
+              orderType: "FAK",
+            });
+            if (!res.success) {
+              // a config-fault (auth/maker/version) can't be fixed by retrying —
+              // disarm and surface it once, exactly like the manual ARM guard
+              if (res.errorMsg && /does not match auth|requires a Relayer|Builder API Key|maker address not allowed|invalid order version/i.test(res.errorMsg)) {
+                useSessionSigner.getState().setEnabled(false);
+                notify({ kind: "SYSTEM", title: "AUTOPILOT PAUSED — CONFIG FAULT", body: res.errorMsg.slice(0, 140), href: "/ai" });
+                sendLiveMail({ kind: "FAULT", key: `autofault:${res.errorMsg.slice(0, 50)}`, title: "AUTOPILOT PAUSED — CONFIG FAULT", detail: `Session-signed entry failed unrecoverably: ${res.errorMsg.slice(0, 160)}` });
+                break;
+              }
+              continue; // transient (no match / thin book) — next candidate
+            }
+            // confirmed-fill accounting. A BUY response is the MIRROR of a
+            // SELL: makingAmount = USDC SPENT, takingAmount = SHARES received
+            // (verified against @polymarket/client order construction). Reading
+            // it in the SELL frame would halve shares and near-zero the cost —
+            // defeating the profit-lock floor and orphaning real shares.
+            let filled = Number(res.takingAmount); // shares received
+            if (Number.isFinite(filled) && filled > shares * 1.05) filled = filled / 1e6;
+            if (!Number.isFinite(filled) || filled <= 0) {
+              if (res.status !== "matched") continue; // unconfirmed — no phantom fill
+              filled = shares;
+            }
+            filled = Math.min(filled, shares);
+            let costUsd = Number(res.makingAmount); // USDC spent
+            if (Number.isFinite(costUsd) && costUsd > filled * 1.05) costUsd = costUsd / 1e6;
+            if (!Number.isFinite(costUsd) || costUsd <= 0 || costUsd > filled * 1.05) costUsd = filled * limit;
+            const entryPx = costUsd / Math.max(filled, 0.01);
+            const entryMid =
+              stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : entryPx;
+            const feeQuote = quote("SIGNAL", costUsd);
+            desk.recordLiveExecution({
+              decisionId: next.id,
+              ts: Math.floor(Date.now() / 1000),
+              slug: next.slug,
+              question: next.question,
+              tokenId: next.tokenId,
+              outcome: next.outcome,
+              entryPrice: entryPx,
+              usd: costUsd,
+              shares: filled,
+              tickSize: tick,
+              negRisk: market.negRisk,
+              costUsd,
+              feeUsd: feeQuote.feeUsd,
+              tpPrice: Math.min(0.99, entryMid * (1 + next.tpFrac)),
+              slPrice: Math.max(0.01, entryMid * (1 - next.slFrac)),
+              deadline: Math.floor(Date.now() / 1000) + effCfg.maxHoldMin * 60,
+              owner: wAddr.toLowerCase(),
+            });
+            logOrder({
+              market: next.question,
+              slug: next.slug,
+              side: "BUY",
+              outcome: next.outcome,
+              price: entryPx,
+              shares: filled,
+              usd: costUsd,
+              orderType: "FAK",
+              clobOrderId: res.orderID ?? null,
+              txHash: res.transactionsHashes?.[0] ?? null,
+              status: res.status ?? "matched",
+              error: null,
+              signer: wAddr.toLowerCase(),
+            });
+            accrue(feeQuote, { market: next.question, notionalUsd: costUsd });
+            cashLeft -= costUsd + feeQuote.feeUsd;
+            headroom -= costUsd;
+            notify({
+              kind: "ORDER",
+              title: "AI DESK — LIVE FILL",
+              body: `BUY ${next.outcome} · ${next.question.slice(0, 52)} — ${filled.toFixed(0)} sh @ ${(entryPx * 100).toFixed(1)}¢`,
+              href: "/ai",
+            });
+            sendLiveMail({
+              kind: "ENTRY",
+              key: `entry:${next.id}`,
+              title: `LIVE ENTRY — BUY ${next.outcome.toUpperCase()} @ ${(entryPx * 100).toFixed(1)}¢`,
+              detail: `$${costUsd.toFixed(2)} filled · TP ${(Math.min(0.99, entryMid * (1 + next.tpFrac)) * 100).toFixed(1)}¢ / SL ${(Math.max(0.01, entryMid * (1 - next.slFrac)) * 100).toFixed(1)}¢ · P(win) ${(next.pWin * 100).toFixed(0)}% · EV +${next.evCents.toFixed(2)}¢/sh`,
+              market: next.question,
+              outcome: next.outcome,
+              entryPrice: entryPx,
+              sizeUsd: costUsd,
+              reasons: next.reasons.slice(0, 4),
+              kpi: liveMailKpi(),
+            });
+          } catch {
+            /* book/order fault — next candidate */
+          }
+        }
+      } finally {
+        liveOpening.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOn, engaged, config, decisions, universe, liveCash]);
 
   useEffect(() => {
     const staged = decisions.filter((d) => d.status === "STAGED");

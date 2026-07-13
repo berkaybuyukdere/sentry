@@ -1225,6 +1225,8 @@ function AutopilotSignerPanel() {
   const sess = useSessionSigner();
   const notify = useNotifications((s) => s.push);
   const liveOpen = useAiDesk((s) => s.liveExecuted);
+  const setDeskConfig = useAiDesk((s) => s.setConfig);
+  const desk = { setConfig: setDeskConfig };
   const { address: connectedAddress } = useAccount();
   const [reveal, setReveal] = useState(false);
   const [importVal, setImportVal] = useState("");
@@ -1258,24 +1260,25 @@ function AutopilotSignerPanel() {
       {!sess.pk ? (
         <>
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
-            EVERY CLOB ORDER IS AN EIP-712 SIGNATURE — WHILE THE KEY LIVES IN PHANTOM, PHANTOM
-            PROMPTS. A KEY STORED HERE SIGNS SILENTLY (HOT KEY — THIS BROWSER ONLY).
+            LIVE ORDERS ARE EIP-712 SIGNATURES — WHILE THE KEY LIVES IN PHANTOM, PHANTOM PROMPTS
+            EVERY TIME. PASTE THE KEY ONCE AND THE DESK SIGNS EVERYTHING SILENTLY, PAPER-SPEED.
+            HOT KEY, THIS BROWSER ONLY — KEEP JUST THE TRADING BANKROLL ON IT.
           </p>
           <p className="mt-1 text-[9px] leading-relaxed text-accent2">
-            FASTEST PATH — SAME ACCOUNT, SAME MONEY, ZERO NEW SETUP: PHANTOM → SETTINGS → MANAGE
-            ACCOUNTS → YOUR ACCOUNT → SHOW PRIVATE KEY (ETHEREUM) → PASTE BELOW. THE EXISTING
-            TRADING WALLET AUTO-LINKS AND EVEN CURRENT OPEN POSITIONS GO SILENT.
+            ONE STEP — PHANTOM → SETTINGS → MANAGE ACCOUNTS → YOUR ACCOUNT → SHOW PRIVATE KEY
+            (ETHEREUM) → PASTE BELOW → IMPORT. SAME ACCOUNT, SAME MONEY: THE TRADING WALLET
+            AUTO-LINKS, AUTOPILOT SELF-ARMS, AND CURRENT OPEN POSITIONS GO SILENT TOO.
           </p>
           <div className="mt-1.5 flex gap-1">
             <input
               value={importVal}
               onChange={(e) => setImportVal(e.target.value)}
-              placeholder="IMPORT PRIVATE KEY (0x…)"
-              className="focus-outline mono-num h-7 min-w-0 flex-1 border border-line bg-raise2 px-2 text-[9.5px] text-text placeholder:text-faint"
+              placeholder="PASTE PHANTOM PRIVATE KEY (0x…)"
+              className="focus-outline mono-num h-7 min-w-0 flex-1 border border-accent/40 bg-raise2 px-2 text-[9.5px] text-text placeholder:text-faint"
             />
             <Btn
               size="sm"
-              variant="ghost"
+              variant="yes"
               onClick={() => {
                 const a = sess.importKey(importVal);
                 if (!a) {
@@ -1284,12 +1287,14 @@ function AutopilotSignerPanel() {
                 }
                 setImportVal("");
                 // same account as the connected wallet → its proxy is the one
-                // we already confirmed on-chain; link it and the setup is done
+                // we already confirmed on-chain; link, ARM, and it's live
                 if (connectedAddress && a.toLowerCase() === connectedAddress.toLowerCase()) {
                   sess.setProxyWallet(POLY_PROXY_WALLET);
-                  notify({ kind: "SYSTEM", title: "AUTOPILOT READY — SAME ACCOUNT", body: "Key matches the connected wallet; existing trading wallet auto-linked. Hit ARM and every order signs silently.", href: "/ai" });
+                  sess.setEnabled(true);
+                  desk.setConfig({ mode: "ARM" }); // hands-free: the desk stages + fills itself
+                  notify({ kind: "SYSTEM", title: "AUTOPILOT ARMED — SAME ACCOUNT", body: "Key matches your wallet; trading wallet auto-linked, staging set to ARM, signing silently. Hit ENGAGE DESK and it trades hands-free at paper speed.", href: "/ai" });
                 } else {
-                  notify({ kind: "SYSTEM", title: "AUTOPILOT KEY IMPORTED", body: `Session signer ${a.slice(0, 10)}… ready — link its proxy wallet next.`, href: "/ai" });
+                  notify({ kind: "SYSTEM", title: "AUTOPILOT KEY IMPORTED", body: `Session signer ${a.slice(0, 10)}… ready — link its proxy wallet below.`, href: "/ai" });
                 }
               }}
             >
@@ -1297,17 +1302,17 @@ function AutopilotSignerPanel() {
             </Btn>
           </div>
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
-            OR START A DEDICATED BURNER (SAFER — MAIN KEY NEVER LEAVES PHANTOM, NEEDS A ONE-TIME
-            POLYMARKET DEPOSIT SETUP):
+            SAFER ALTERNATIVE — A DEDICATED BURNER (MAIN KEY NEVER LEAVES PHANTOM, BUT NEEDS A
+            ONE-TIME POLYMARKET DEPOSIT + PROXY LINK):
           </p>
           <button
             onClick={() => {
               const a = sess.generate();
               notify({ kind: "SYSTEM", title: "AUTOPILOT KEY GENERATED", body: `Session signer ${a.slice(0, 10)}… created — complete the one-time Polymarket setup.`, href: "/ai" });
             }}
-            className="focus-outline mt-1 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20"
+            className="focus-outline mt-1 flex h-8 w-full items-center justify-center border border-line bg-raise2 text-[10px] font-medium uppercase tracking-[0.1em] text-dim transition-colors hover:text-text"
           >
-            GENERATE FRESH AUTOPILOT KEY
+            GENERATE FRESH BURNER KEY
           </button>
         </>
       ) : (
@@ -1362,8 +1367,8 @@ function AutopilotSignerPanel() {
           )}
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
             {armed
-              ? "NEW LIVE ENTRIES + THEIR EXITS SIGN WITH THE SESSION KEY — NO PROMPTS. BALANCES, KPIs AND ORDERS TRACK THE SESSION PROXY."
-              : "DISARMED — NEW ORDERS FALL BACK TO PHANTOM (ONE PROMPT PER ORDER). SESSION-OWNED POSITIONS STAY MANAGED BY THE KEY."}
+              ? "ARMED — THE DESK FILLS MULTIPLE ENTRIES PER SWEEP AND MANAGES EXITS AT PAPER SPEED, ALL SIGNED SILENTLY. NO PROMPTS. SET STAGING TO ARM + ENGAGE THE DESK."
+              : "DISARMED — NEW ORDERS FALL BACK TO PHANTOM (ONE PROMPT PER ORDER, ONE AT A TIME). SESSION-OWNED POSITIONS STAY MANAGED BY THE KEY."}
           </p>
           {armed && phantomOwnedOpen.length > 0 && (
             <p className="mt-1 text-[9px] leading-relaxed text-warn2">
