@@ -1,4 +1,4 @@
-import { createSecureClient, production, relayerApiKey, type SecureClient } from "@polymarket/client";
+import { createSecureClient, production, forkEnvironmentConfig, relayerApiKey, type SecureClient } from "@polymarket/client";
 import { useApiAccess } from "../apiAccess";
 import { builderApiKeyBrowser } from "./builderAuth";
 import { signerFrom } from "@polymarket/client/viem";
@@ -17,6 +17,14 @@ import type { WalletClient } from "viem";
  * Non-custodial invariant holds: `signerFrom(walletClient)` delegates every
  * signature to the user's own wallet; nothing is signed without a prompt.
  */
+
+// The client's default `production` environment points its on-chain reads
+// (allowance checks inside setupTradingApprovals, isWalletDeployed, etc.) at
+// https://polygon.drpc.org, which 500s under load — that silently aborted
+// every approval-repair attempt with no visible error to the user. Fork onto
+// the same reliable RPC our own wagmi config already trusts.
+const RELIABLE_RPC = "https://polygon-bor-rpc.publicnode.com";
+const environment = forkEnvironmentConfig({ name: "sentry", rpc: RELIABLE_RPC }, production);
 
 let cache: { key: string; client: Promise<SecureClient> } | null = null;
 
@@ -57,7 +65,7 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
   // Key in the client configuration"), stored via Settings → RELAYER API KEY.
   const client = createSecureClient({
     signer: signerFrom(wallet),
-    environment: production,
+    environment,
     ...(auth ? { apiKey: auth } : {}),
   }).then((c) => {
     localStorage.setItem(DW_KEY(address.toLowerCase()), c.account.wallet);
