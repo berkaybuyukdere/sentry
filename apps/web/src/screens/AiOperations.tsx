@@ -17,7 +17,7 @@ import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/tra
 import { signAndPlaceOrder, snapToTick } from "../lib/trading/orders";
 import { useSessionSigner, sessionAddress, sessionWalletClient } from "../lib/trading/sessionSigner";
 import { sendLiveMail } from "../lib/liveMail";
-import { USDC, PUSD, LEGACY_DEPOSIT_WALLET } from "../lib/trading/constants";
+import { USDC, PUSD, LEGACY_DEPOSIT_WALLET, POLY_PROXY_WALLET } from "../lib/trading/constants";
 import {
   useAiDesk,
   paperEquity,
@@ -223,7 +223,9 @@ function Desk() {
   // runs; in LIVE mode the bankroll is the wallet's real Polygon USDC.e
   const fwBase = paperMode
     ? (paper.active ? equity : config.startingCapitalUsd)
-    : Math.min((depositWallet ? tradingBal : prov.usdcBalance) ?? config.budgetUsd, config.budgetUsd);
+    : config.budgetAuto
+      ? ((depositWallet ? tradingBal : prov.usdcBalance) ?? 0)
+      : Math.min((depositWallet ? tradingBal : prov.usdcBalance) ?? config.budgetUsd, config.budgetUsd);
   const eff = effectiveDeskConfig(config, fwBase, paper.active ? paper.startingCapital : config.startingCapitalUsd);
 
   const manualClose = async (p: PaperPosition) => {
@@ -507,14 +509,40 @@ function Desk() {
                 )}
               </div>
               <div className="mt-2">
-                <NumField
-                  label="DESK BUDGET $ — MAX THE DESK MAY DEPLOY"
-                  value={config.budgetUsd}
-                  onChange={(v) => desk.setConfig({ budgetUsd: v })}
-                />
+                <div className="label-faint mb-1">DESK BUDGET — MAX THE DESK MAY DEPLOY</div>
+                <div className="flex gap-px bg-line">
+                  <button
+                    onClick={() => desk.setConfig({ budgetAuto: true })}
+                    className={cx(
+                      "focus-outline h-8 flex-1 text-[8.5px] font-medium tracking-[0.08em] transition-colors",
+                      config.budgetAuto ? "bg-raise3 text-pos" : "bg-raise2 text-faint hover:text-dim",
+                    )}
+                  >
+                    AUTO — FOLLOW WALLET
+                  </button>
+                  <button
+                    onClick={() => desk.setConfig({ budgetAuto: false })}
+                    className={cx(
+                      "focus-outline h-8 flex-1 text-[8.5px] font-medium tracking-[0.08em] transition-colors",
+                      !config.budgetAuto ? "bg-raise3 text-text" : "bg-raise2 text-faint hover:text-dim",
+                    )}
+                  >
+                    FIXED CAP $
+                  </button>
+                </div>
+                {!config.budgetAuto && (
+                  <div className="mt-1.5">
+                    <NumField
+                      label="FIXED BUDGET $"
+                      value={config.budgetUsd}
+                      onChange={(v) => desk.setConfig({ budgetUsd: v })}
+                    />
+                  </div>
+                )}
                 <p className="mt-1 text-[9px] leading-relaxed text-faint">
-                  BANKROLL = MIN(WALLET USDC.E, BUDGET). SET IT, SWITCH STAGING TO ARM, AND THE DESK
-                  RUNS TO TARGET BY ITSELF — YOUR WALLET POPS UP ONLY TO SIGN EACH ORDER.
+                  {config.budgetAuto
+                    ? `BANKROLL TRACKS THE FULL WALLET (${tradingBal !== null ? fmt.usd(tradingBal, { compact: false }) : "—"}) — AS PROFITS LAND, CLIP SIZES AND DEPLOYMENT GROW WITH THE BANK AUTOMATICALLY.`
+                    : "BANKROLL = MIN(WALLET, BUDGET) — THE DESK NEVER DEPLOYS PAST THE CAP EVEN AS THE WALLET GROWS."}
                 </p>
               </div>
               <Link
@@ -1159,6 +1187,7 @@ function AutopilotSignerPanel() {
   const sess = useSessionSigner();
   const notify = useNotifications((s) => s.push);
   const liveOpen = useAiDesk((s) => s.liveExecuted);
+  const { address: connectedAddress } = useAccount();
   const [reveal, setReveal] = useState(false);
   const [importVal, setImportVal] = useState("");
   const [proxyVal, setProxyVal] = useState("");
@@ -1192,23 +1221,18 @@ function AutopilotSignerPanel() {
         <>
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
             EVERY CLOB ORDER IS AN EIP-712 SIGNATURE — WHILE THE KEY LIVES IN PHANTOM, PHANTOM
-            PROMPTS. A DEDICATED SESSION KEY SIGNS SILENTLY. IT IS A HOT KEY STORED ONLY IN THIS
-            BROWSER: KEEP ONLY THE TRADING BANKROLL ON IT.
+            PROMPTS. A KEY STORED HERE SIGNS SILENTLY (HOT KEY — THIS BROWSER ONLY).
           </p>
-          <button
-            onClick={() => {
-              const a = sess.generate();
-              notify({ kind: "SYSTEM", title: "AUTOPILOT KEY GENERATED", body: `Session signer ${a.slice(0, 10)}… created — complete the one-time Polymarket setup.`, href: "/ai" });
-            }}
-            className="focus-outline mt-1.5 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20"
-          >
-            GENERATE AUTOPILOT KEY
-          </button>
+          <p className="mt-1 text-[9px] leading-relaxed text-accent2">
+            FASTEST PATH — SAME ACCOUNT, SAME MONEY, ZERO NEW SETUP: PHANTOM → SETTINGS → MANAGE
+            ACCOUNTS → YOUR ACCOUNT → SHOW PRIVATE KEY (ETHEREUM) → PASTE BELOW. THE EXISTING
+            TRADING WALLET AUTO-LINKS AND EVEN CURRENT OPEN POSITIONS GO SILENT.
+          </p>
           <div className="mt-1.5 flex gap-1">
             <input
               value={importVal}
               onChange={(e) => setImportVal(e.target.value)}
-              placeholder="OR IMPORT EXISTING PRIVATE KEY (0x…)"
+              placeholder="IMPORT PRIVATE KEY (0x…)"
               className="focus-outline mono-num h-7 min-w-0 flex-1 border border-line bg-raise2 px-2 text-[9.5px] text-text placeholder:text-faint"
             />
             <Btn
@@ -1216,17 +1240,37 @@ function AutopilotSignerPanel() {
               variant="ghost"
               onClick={() => {
                 const a = sess.importKey(importVal);
-                if (a) {
-                  setImportVal("");
-                  notify({ kind: "SYSTEM", title: "AUTOPILOT KEY IMPORTED", body: `Session signer ${a.slice(0, 10)}… ready.`, href: "/ai" });
-                } else {
+                if (!a) {
                   notify({ kind: "SYSTEM", title: "INVALID PRIVATE KEY", body: "Expected a 64-hex-char key (0x-prefixed).", href: "/ai" });
+                  return;
+                }
+                setImportVal("");
+                // same account as the connected wallet → its proxy is the one
+                // we already confirmed on-chain; link it and the setup is done
+                if (connectedAddress && a.toLowerCase() === connectedAddress.toLowerCase()) {
+                  sess.setProxyWallet(POLY_PROXY_WALLET);
+                  notify({ kind: "SYSTEM", title: "AUTOPILOT READY — SAME ACCOUNT", body: "Key matches the connected wallet; existing trading wallet auto-linked. Hit ARM and every order signs silently.", href: "/ai" });
+                } else {
+                  notify({ kind: "SYSTEM", title: "AUTOPILOT KEY IMPORTED", body: `Session signer ${a.slice(0, 10)}… ready — link its proxy wallet next.`, href: "/ai" });
                 }
               }}
             >
               IMPORT
             </Btn>
           </div>
+          <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
+            OR START A DEDICATED BURNER (SAFER — MAIN KEY NEVER LEAVES PHANTOM, NEEDS A ONE-TIME
+            POLYMARKET DEPOSIT SETUP):
+          </p>
+          <button
+            onClick={() => {
+              const a = sess.generate();
+              notify({ kind: "SYSTEM", title: "AUTOPILOT KEY GENERATED", body: `Session signer ${a.slice(0, 10)}… created — complete the one-time Polymarket setup.`, href: "/ai" });
+            }}
+            className="focus-outline mt-1 flex h-8 w-full items-center justify-center border border-accent/50 bg-accent/10 text-[10px] font-medium uppercase tracking-[0.1em] text-accent2 transition-colors hover:bg-accent/20"
+          >
+            GENERATE FRESH AUTOPILOT KEY
+          </button>
         </>
       ) : (
         <>

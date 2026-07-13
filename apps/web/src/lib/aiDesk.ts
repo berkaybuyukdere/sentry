@@ -62,6 +62,11 @@ export interface DeskConfig {
   tempo: Tempo;
   startingCapitalUsd: number;
   budgetUsd: number;
+  /** AUTO bankroll: ignore budgetUsd and track the full wallet balance —
+   *  as profits land, clip sizing and deployment grow with the bank
+   *  ("hacim arttıkça bahis de artsın"). FREE WILL clips stay 0.2–3% of
+   *  equity, so growth compounds without a manual budget bump. */
+  budgetAuto: boolean;
   minTradeUsd: number;
   maxTradeUsd: number;
   targetProfitUsd: number;
@@ -327,6 +332,7 @@ export const DEFAULT_CONFIG: DeskConfig = {
   tempo: "SCALP",
   startingCapitalUsd: 500,
   budgetUsd: 500,
+  budgetAuto: true,
   minTradeUsd: 2,
   maxTradeUsd: 3,
   targetProfitUsd: 50,
@@ -1155,12 +1161,15 @@ export function useAiDeskEngine() {
   // is 0 — never fall back to budgetUsd with banked profit on the line.
   const locked = desk.lockedProfitUsd;
   const liveCashFloor = locked > 0 && desk.liveBaseline !== null ? desk.liveBaseline + locked : null;
+  // AUTO bankroll tracks the whole wallet — realized profit compounds into
+  // sizing without a manual budget bump; a fixed budget stays a hard cap
+  const budgetCap = config.budgetAuto ? Number.POSITIVE_INFINITY : config.budgetUsd;
   const livePlayable =
     liveCashFloor !== null
       ? liveCash !== null
-        ? Math.max(0, Math.min(liveCash - liveCashFloor, config.budgetUsd))
+        ? Math.max(0, Math.min(liveCash - liveCashFloor, budgetCap))
         : 0
-      : Math.min(liveCash ?? config.budgetUsd, config.budgetUsd);
+      : Math.min(liveCash ?? (config.budgetAuto ? 0 : config.budgetUsd), budgetCap);
   const liveEquity =
     config.executionMode === "PAPER" && paper.active ? paperEquity(paper, markOf) : livePlayable;
   const effCfg = effectiveDeskConfig(config, liveEquity, paper.startingCapital || config.startingCapitalUsd);
@@ -1189,13 +1198,14 @@ export function useAiDeskEngine() {
       }).filter(Boolean),
     );
     const floor = st.lockedProfitUsd > 0 && st.liveBaseline !== null ? st.liveBaseline + st.lockedProfitUsd : null;
+    const cap = config.budgetAuto ? Number.POSITIVE_INFINITY : config.budgetUsd;
     const equity = config.executionMode === "PAPER" && st.paper.active
       ? paperEquity(st.paper, markOf)
       : floor !== null
         ? liveCash !== null
-          ? Math.max(0, Math.min(liveCash - floor, config.budgetUsd))
+          ? Math.max(0, Math.min(liveCash - floor, cap))
           : 0 // fail closed under an active lock
-        : Math.min(liveCash ?? config.budgetUsd, config.budgetUsd);
+        : Math.min(liveCash ?? (config.budgetAuto ? 0 : config.budgetUsd), cap);
     // slots count only the CURRENT identity's positions — the other account's
     // book (e.g. Phantom's legacy positions while autopilot is armed) must not
     // starve this identity's deployment
