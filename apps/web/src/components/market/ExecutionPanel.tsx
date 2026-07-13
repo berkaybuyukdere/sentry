@@ -2,13 +2,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { X, ShieldCheck, ShieldAlert } from "lucide-react";
-import { useAccount, useWalletClient, useSwitchChain } from "wagmi";
+import { useAccount, useWalletClient, useSwitchChain, useReadContracts } from "wagmi";
 import { polygon } from "wagmi/chains";
+import { erc20Abi } from "viem";
 import { bookStats, estimateFill, fmt } from "@sentry-app/polymarket";
 import { useOrderBook } from "../../lib/queries";
 import { useTicket } from "./ticket";
 import { signAndPlaceOrder, snapToTick, type PlacedOrder } from "../../lib/trading/orders";
 import { useProvision } from "../../lib/trading/provision";
+import { cachedDepositWallet } from "../../lib/trading/v2client";
+import { USDC, PUSD } from "../../lib/trading/constants";
 import { useOrderLog } from "../../lib/trading/orderLog";
 import { useNotifications } from "../../lib/alerts";
 import { useBilling, bpsPct } from "../../lib/billing";
@@ -28,6 +31,23 @@ export function ExecutionPanel() {
   const provision = useProvision();
   const logOrder = useOrderLog((s) => s.log);
   const notify = useNotifications((s) => s.push);
+  // V2 orders execute from the Polymarket Deposit Wallet, not the EOA — once
+  // linked, ITS balance is what actually gates whether an order can fill
+  // ("INSUFFICIENT USDC — AVAILABLE $0" was reading the now-empty EOA)
+  const depositWallet = address ? cachedDepositWallet(address) : null;
+  const dwReads = useReadContracts({
+    contracts: depositWallet
+      ? [
+          { address: USDC, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
+          { address: PUSD, abi: erc20Abi, functionName: "balanceOf", args: [depositWallet] },
+        ]
+      : [],
+    query: { enabled: !!depositWallet, refetchInterval: 15_000 },
+  });
+  const tradingBalance = depositWallet
+    ? Number(((dwReads.data?.[0]?.result as bigint | undefined) ?? 0n) + ((dwReads.data?.[1]?.result as bigint | undefined) ?? 0n)) / 1e6
+    : null;
+  const spendableBalance = depositWallet ? tradingBalance : provision.usdcBalance;
 
   const tokenId = market?.clobTokenIds[outcomeIndex];
   const { data: book } = useOrderBook(open ? tokenId : undefined, 5000);
@@ -356,7 +376,7 @@ export function ExecutionPanel() {
             <Btn variant="accent" size="lg" onClick={() => switchChain({ chainId: polygon.id })}>
               SWITCH TO POLYGON
             </Btn>
-          ) : !provision.provisioned ? (
+          ) : !depositWallet && !provision.provisioned ? (
             <ProvisionBlock />
           ) : phase === "done" && result ? (
             <div className="border border-pos/40 bg-pos/5 p-3">
@@ -378,7 +398,7 @@ export function ExecutionPanel() {
             <>
               <button
                 onClick={execute}
-                disabled={phase === "signing" || !est || usd <= 0 || (side === "BUY" && provision.usdcBalance !== null && usd > provision.usdcBalance)}
+                disabled={phase === "signing" || !est || usd <= 0 || (side === "BUY" && spendableBalance !== null && usd > spendableBalance)}
                 className={cx(
                   "focus-outline h-10 w-full border text-[12px] font-semibold uppercase tracking-[0.16em] transition-colors active:translate-y-px disabled:pointer-events-none disabled:opacity-40",
                   side === "BUY"
@@ -388,11 +408,12 @@ export function ExecutionPanel() {
               >
                 {phase === "signing" ? "AWAITING SIGNATURE…" : `EXECUTE ${side === "BUY" ? outcome.toUpperCase() : `${side} ${outcome.toUpperCase()}`} POSITION`}
               </button>
-              {side === "BUY" && provision.usdcBalance !== null && usd > provision.usdcBalance && (
+              {side === "BUY" && spendableBalance !== null && usd > spendableBalance && (
                 <div className="text-[10px] text-warn2">
-                  INSUFFICIENT USDC — AVAILABLE {fmt.usd(provision.usdcBalance, { compact: false })}{" "}
-                  <Link to="/treasury" className="text-accent2 underline decoration-line underline-offset-2">
-                    FUND VIA TREASURY
+                  INSUFFICIENT {depositWallet ? "TRADING WALLET BALANCE" : "USDC"} — AVAILABLE{" "}
+                  {fmt.usd(spendableBalance, { compact: false })}{" "}
+                  <Link to="/ai" className="text-accent2 underline decoration-line underline-offset-2">
+                    {depositWallet ? "FUND VIA AI DESK" : "FUND VIA TREASURY"}
                   </Link>
                 </div>
               )}

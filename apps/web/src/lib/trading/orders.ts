@@ -72,7 +72,13 @@ export async function signAndPlaceOrder(
     }
     const orderType = intent.orderType === "FOK" ? V2OrderType.FOK : V2OrderType.FAK;
     if (intent.side === "BUY") {
-      const amount = Math.round(price * shares * 100) / 100;
+      // Polymarket rejects BUY notionals under $1 ("invalid amount ... min
+      // size: $1"). The v2 client re-quotes against the live book and can
+      // shave a percent or two for fees/slippage before filling, so a clip
+      // computed at exactly $1.00 can land at $0.98 post-fill and bounce —
+      // pad with a 3% buffer and a $1.05 floor so it always clears.
+      const raw = Math.round(price * shares * 100) / 100;
+      const amount = Math.round(Math.max(raw * 1.03, 1.05) * 100) / 100;
       return client.placeMarketOrder({
         tokenId: intent.tokenId,
         side: V2Side.BUY,

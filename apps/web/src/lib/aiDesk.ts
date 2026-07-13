@@ -267,7 +267,7 @@ export const DEFAULT_CONFIG: DeskConfig = {
   tempo: "SCALP",
   startingCapitalUsd: 500,
   budgetUsd: 500,
-  minTradeUsd: 1,
+  minTradeUsd: 2,
   maxTradeUsd: 3,
   targetProfitUsd: 50,
   maxLossUsd: 100,
@@ -448,7 +448,7 @@ export function effectiveDeskConfig(cfg: DeskConfig, equity: number, startingCap
   if (!cfg.freeWill) return cfg;
   const T = TEMPO_PARAMS[cfg.tempo];
   const eq = Math.max(equity, 10);
-  const minTrade = Math.max(1, Math.round(eq * 0.002));
+  const minTrade = Math.max(2, Math.round(eq * 0.002)); // $1 clips sit right at the CLOB minimum after client-side fee/slippage shave
   return {
     ...cfg,
     minTradeUsd: minTrade,
