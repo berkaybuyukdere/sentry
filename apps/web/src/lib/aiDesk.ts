@@ -265,6 +265,10 @@ interface DeskState {
   applyAiVerdicts: (verdicts: { id: string; go: boolean; note: string }[]) => void;
   recordLiveExecution: (r: LiveExecution) => void;
   recordLiveClose: (decisionId: string, exitPrice: number, proceeds: number, exitFee: number, reason: LiveClosedTrade["reason"]) => void;
+  /** FAK sells can fill PARTIALLY: ledger the filled slice at its real
+   *  proceeds and shrink the open position — treating a partial as a full
+   *  close would orphan the unsold shares with no exit management */
+  recordLivePartialClose: (decisionId: string, filledShares: number, exitPrice: number, proceeds: number, exitFee: number, reason: LiveClosedTrade["reason"]) => void;
   /** one-time TP/SL/deadline rebase for migrated positions — persisted so it
    *  survives reloads (merge-derived values alone never reach localStorage) */
   rebaseLivePosition: (decisionId: string, patch: Partial<LiveExecution>) => void;
@@ -453,6 +457,43 @@ export const useAiDesk = create<DeskState>()(
           };
           return {
             liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
+            liveClosed: [trade, ...s.liveClosed].slice(0, 100),
+          };
+        }),
+
+      recordLivePartialClose: (decisionId, filledShares, exitPrice, proceeds, exitFee, reason) =>
+        set((s) => {
+          const pos = s.liveExecuted.find((e) => e.decisionId === decisionId);
+          if (!pos || filledShares <= 0) return s;
+          const frac = Math.min(1, filledShares / pos.shares);
+          const costSlice = pos.costUsd * frac;
+          const feeSlice = pos.feeUsd * frac;
+          const trade: LiveClosedTrade = {
+            decisionId: `${decisionId}·P${Math.floor(Date.now() / 1000)}`,
+            ts: pos.ts,
+            slug: pos.slug,
+            question: pos.question,
+            outcome: pos.outcome,
+            entryPrice: pos.entryPrice,
+            exitPrice,
+            shares: filledShares,
+            costUsd: costSlice,
+            feeUsd: feeSlice,
+            exitFee,
+            pnl: proceeds - exitFee - costSlice - feeSlice,
+            reason,
+            closedTs: Math.floor(Date.now() / 1000),
+          };
+          const remainder = pos.shares - filledShares;
+          return {
+            liveExecuted:
+              remainder < 0.01
+                ? s.liveExecuted.filter((e) => e.decisionId !== decisionId)
+                : s.liveExecuted.map((e) =>
+                    e.decisionId === decisionId
+                      ? { ...e, shares: remainder, costUsd: e.costUsd - costSlice, feeUsd: e.feeUsd - feeSlice, usd: e.usd * (1 - frac) }
+                      : e,
+                  ),
             liveClosed: [trade, ...s.liveClosed].slice(0, 100),
           };
         }),
@@ -1600,6 +1641,7 @@ export function useAiDeskEngine() {
   const liveClosing = useRef(false);
   const liveSlBreach = useRef(new Map<string, number>());
   const liveUnmanagedWarned = useRef(new Set<string>()); // one warning per stuck position
+  const liveDustWarned = useRef(new Set<string>()); // one note per sub-$1 unsellable remainder
   useEffect(() => {
     if (config.executionMode !== "LIVE" || !desk.liveExecuted.length) return;
     if (!phantomWalletClient && !sessReady) return; // no signer available at all
@@ -1687,41 +1729,87 @@ export function useAiDeskEngine() {
             const mkt = universe?.find((m) => m.slug === p.slug);
             const tickSize = mkt?.tickSize ?? p.tickSize;
             const negRisk = mkt?.negRisk ?? p.negRisk;
-            const price = Math.max(tickSize, mark * 0.98 - tickSize); // slippage-guarded sell bound
-            const snapped = snapToTick(price, tickSize);
+            // FAK sells must be priced off the ACTUAL bids, not the mid: on a
+            // thin/wide book the mid sits far above the best bid, the bound
+            // never matches, and the order dies "no orders found to match"
+            // every tick forever (observed live). BUT only bids near the top
+            // of the book count — estimateSell walks the whole stack, and a
+            // garbage penny-bid wall would drag the average down and set its
+            // own acceptance price (dumping the position for ~nothing).
+            if (stats.bestBid === null) continue;
+            const bidFloor = Math.max(tickSize, stats.bestBid * 0.9);
+            const sellPreview = estimateSell(stats.bids.filter((b) => b.price >= bidFloor), p.shares);
+            const sellShares = Math.floor(sellPreview.filledShares * 100) / 100;
+            if (sellShares < 0.01) continue; // no real depth near the top — retry later
+            // CLOB rejects sub-$1 notionals — dust can never be sold; hold it
+            // for resolution instead of hammering doomed orders every tick
+            if (sellShares * sellPreview.avgPrice < 1.02) {
+              if (!liveDustWarned.current.has(p.decisionId)) {
+                liveDustWarned.current.add(p.decisionId);
+                notify({ kind: "SYSTEM", title: "REMAINDER BELOW CLOB $1 MINIMUM", body: `${p.question.slice(0, 56)} — ${sellShares.toFixed(2)} sh (~$${(sellShares * sellPreview.avgPrice).toFixed(2)}) cannot be sold; it rides to resolution.`, href: "/ai" });
+              }
+              continue;
+            }
+            liveDustWarned.current.delete(p.decisionId);
+            const bound = Math.max(tickSize, sellPreview.avgPrice * 0.985 - tickSize);
+            const snapped = snapToTick(bound, tickSize);
             const res = await signAndPlaceOrder(wClient, wAddr, {
               tokenId: p.tokenId,
               side: "SELL",
               price: snapped,
-              shares: p.shares,
+              shares: sellShares,
               tickSize,
               negRisk,
               orderType: "FAK",
             });
             if (!res.success) continue; // retry next tick
-            const proceeds = Number(res.makingAmount ?? p.shares * mark);
+            // response semantics for a SELL: makingAmount = shares we gave,
+            // takingAmount = DOLLARS received. Only a CONFIRMED fill may be
+            // ledgered — assuming a fill on an amountless/delayed response
+            // fabricates proceeds and orphans real shares (safe direction for
+            // a 5s retry loop is zero-fill).
+            let filled = Number(res.makingAmount);
+            if (Number.isFinite(filled) && filled > sellShares * 1.05) filled = filled / 1e6;
+            if (!Number.isFinite(filled) || filled <= 0) {
+              if (res.status !== "matched") continue; // unconfirmed — retry next tick
+              filled = sellShares; // server says matched; amounts absent
+            }
+            filled = Math.min(filled, sellShares);
+            let proceeds = Number(res.takingAmount);
+            if (Number.isFinite(proceeds) && proceeds > filled * 1.05) proceeds = proceeds / 1e6;
+            if (!Number.isFinite(proceeds) || proceeds <= 0 || proceeds > filled * 1.05) proceeds = filled * sellPreview.avgPrice;
+            const exitPx = proceeds / Math.max(filled, 0.01); // honest average fill, not the mid
             const exitFeeQuote = quote("SIGNAL", proceeds);
             const reason = hitTp && !hitSl ? "TAKE_PROFIT" : hitSl ? "STOP_LOSS" : "TIME_EXIT";
-            liveSlBreach.current.delete(p.decisionId);
-            desk.recordLiveClose(p.decisionId, mark, proceeds, exitFeeQuote.feeUsd, reason);
+            const fullClose = filled >= p.shares - 0.01;
+            if (fullClose) {
+              liveSlBreach.current.delete(p.decisionId);
+              desk.recordLiveClose(p.decisionId, exitPx, proceeds, exitFeeQuote.feeUsd, reason);
+            } else {
+              // keep the SL breach streak: the remainder is still through its
+              // stop — waiting 2 fresh ticks per slice prolongs a falling exit
+              desk.recordLivePartialClose(p.decisionId, filled, exitPx, proceeds, exitFeeQuote.feeUsd, reason);
+            }
             accrue(exitFeeQuote, { market: p.question, notionalUsd: proceeds });
-            const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd - p.feeUsd;
+            const frac = fullClose ? 1 : filled / p.shares;
+            const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd * frac - p.feeUsd * frac;
+            const partialTag = fullClose ? "" : ` (PARTIAL ${filled.toFixed(2)}/${p.shares.toFixed(2)} SH)`;
             notify({
               kind: "ORDER",
-              title: `AI DESK — LIVE ${reason.replaceAll("_", " ")}`,
+              title: `AI DESK — LIVE ${reason.replaceAll("_", " ")}${partialTag}`,
               body: `${p.question.slice(0, 56)} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} net`,
               href: "/ai",
             });
             sendLiveMail({
               kind: "CLOSE",
-              key: `close:${p.decisionId}`,
-              title: `${reason.replaceAll("_", " ")} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
-              detail: `${p.outcome.toUpperCase()} closed at ${(mark * 100).toFixed(1)}¢ (entry ${(p.entryPrice * 100).toFixed(1)}¢) for ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} after fees.`,
+              key: `close:${p.decisionId}:${fullClose ? "full" : now}`,
+              title: `${reason.replaceAll("_", " ")}${partialTag} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
+              detail: `${p.outcome.toUpperCase()} ${fullClose ? "closed" : "partially closed"} at ${(exitPx * 100).toFixed(1)}¢ avg (entry ${(p.entryPrice * 100).toFixed(1)}¢) for ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} after fees.`,
               market: p.question,
               outcome: p.outcome,
               entryPrice: p.entryPrice,
-              exitPrice: mark,
-              sizeUsd: p.costUsd,
+              exitPrice: exitPx,
+              sizeUsd: p.costUsd * frac,
               pnlUsd: pnl,
               reason,
               kpi: liveMailKpi(),

@@ -260,13 +260,29 @@ function Desk() {
     try {
       const book = await fetchOrderBook(p.tokenId);
       const stats = bookStats(book);
-      const mark = stats.bestBid !== null && stats.bestAsk !== null ? (stats.bestBid + stats.bestAsk) / 2 : markOf(p.tokenId, p.entryPrice);
-      const price = Math.max(p.tickSize, mark * 0.98 - p.tickSize); // slippage-guarded sell bound
+      // price the FAK off bids NEAR THE TOP of the book: estimateSell walks
+      // the whole stack, so a penny-bid wall would set its own acceptance
+      // price and the close would dump the position for ~nothing
+      if (stats.bestBid === null) {
+        notify({ kind: "SYSTEM", title: "CLOSE BLOCKED — NO BIDS", body: "The book has no buyers right now; there is nothing to sell into. Try again when liquidity returns.", href: "/ai" });
+        return;
+      }
+      const bidFloor = Math.max(p.tickSize, stats.bestBid * 0.9);
+      const sellPreview = estimateSell(stats.bids.filter((b) => b.price >= bidFloor), p.shares);
+      const sellShares = Math.floor(sellPreview.filledShares * 100) / 100;
+      if (sellShares < 0.01) {
+        notify({ kind: "SYSTEM", title: "CLOSE BLOCKED — NO REAL DEPTH", body: "No buyers near the top of the book; selling now would dump into junk bids. Try again when liquidity returns.", href: "/ai" });
+        return;
+      }
+      if (sellShares * sellPreview.avgPrice < 1.02) {
+        notify({ kind: "SYSTEM", title: "CLOSE BLOCKED — BELOW CLOB $1 MINIMUM", body: `${sellShares.toFixed(2)} sh (~$${(sellShares * sellPreview.avgPrice).toFixed(2)}) is under the exchange's $1 order minimum; it rides to resolution.`, href: "/ai" });
+        return;
+      }
       const res = await signAndPlaceOrder(wClient, wAddr, {
         tokenId: p.tokenId,
         side: "SELL",
-        price: snapToTick(price, p.tickSize),
-        shares: p.shares,
+        price: snapToTick(Math.max(p.tickSize, sellPreview.avgPrice * 0.985 - p.tickSize), p.tickSize),
+        shares: sellShares,
         tickSize: p.tickSize,
         negRisk: p.negRisk,
         orderType: "FAK",
@@ -275,21 +291,43 @@ function Desk() {
         notify({ kind: "SYSTEM", title: "MANUAL CLOSE FAILED", body: (res.errorMsg ?? "order rejected").slice(0, 160), href: "/ai" });
         return;
       }
-      const proceeds = Number(res.makingAmount ?? p.shares * mark);
+      // SELL response: makingAmount = shares given, takingAmount = DOLLARS
+      // received. Only a CONFIRMED fill is ledgered — an amountless/delayed
+      // response must not fabricate proceeds or orphan real shares.
+      let filled = Number(res.makingAmount);
+      if (Number.isFinite(filled) && filled > sellShares * 1.05) filled = filled / 1e6;
+      if (!Number.isFinite(filled) || filled <= 0) {
+        if (res.status !== "matched") {
+          notify({ kind: "SYSTEM", title: "CLOSE UNCONFIRMED", body: `Order ${res.status ?? "accepted"} but no fill reported — nothing ledgered. Check the Orders screen and retry.`, href: "/orders" });
+          return;
+        }
+        filled = sellShares;
+      }
+      filled = Math.min(filled, sellShares);
+      let proceeds = Number(res.takingAmount);
+      if (Number.isFinite(proceeds) && proceeds > filled * 1.05) proceeds = proceeds / 1e6;
+      if (!Number.isFinite(proceeds) || proceeds <= 0 || proceeds > filled * 1.05) proceeds = filled * sellPreview.avgPrice;
+      const exitPx = proceeds / Math.max(filled, 0.01); // honest average fill, not the mid
       const exitFeeQuote = billing("SIGNAL", proceeds);
-      desk.recordLiveClose(p.decisionId, mark, proceeds, exitFeeQuote.feeUsd, "MANUAL");
+      const fullClose = filled >= p.shares - 0.01;
+      if (fullClose) {
+        desk.recordLiveClose(p.decisionId, exitPx, proceeds, exitFeeQuote.feeUsd, "MANUAL");
+      } else {
+        desk.recordLivePartialClose(p.decisionId, filled, exitPx, proceeds, exitFeeQuote.feeUsd, "MANUAL");
+      }
       accrue(exitFeeQuote, { market: p.question, notionalUsd: proceeds });
-      const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd - p.feeUsd;
+      const frac = fullClose ? 1 : filled / p.shares;
+      const pnl = proceeds - exitFeeQuote.feeUsd - p.costUsd * frac - p.feeUsd * frac;
       sendLiveMail({
         kind: "CLOSE",
-        key: `close:${p.decisionId}`,
-        title: `MANUAL CLOSE — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
-        detail: `${p.outcome.toUpperCase()} closed by operator at ${(mark * 100).toFixed(1)}¢ (entry ${(p.entryPrice * 100).toFixed(1)}¢).`,
+        key: `close:${p.decisionId}:${fullClose ? "full" : Date.now()}`,
+        title: `MANUAL CLOSE${fullClose ? "" : " (PARTIAL)"} — ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} NET`,
+        detail: `${p.outcome.toUpperCase()} ${fullClose ? "closed" : `partially closed (${filled.toFixed(2)}/${p.shares.toFixed(2)} sh)`} by operator at ${(exitPx * 100).toFixed(1)}¢ avg (entry ${(p.entryPrice * 100).toFixed(1)}¢).`,
         market: p.question,
         outcome: p.outcome,
         entryPrice: p.entryPrice,
-        exitPrice: mark,
-        sizeUsd: p.costUsd,
+        exitPrice: exitPx,
+        sizeUsd: p.costUsd * frac,
         pnlUsd: pnl,
         reason: "MANUAL",
       });
