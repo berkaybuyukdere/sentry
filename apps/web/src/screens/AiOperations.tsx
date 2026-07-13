@@ -340,10 +340,8 @@ function Desk() {
                       </span>
                     </div>
                     <p className="mt-1 text-[9px] leading-relaxed text-faint">
-                      CLOB V2 EXECUTES FROM YOUR POLYMARKET DEPOSIT WALLET, NOT THE EOA. THIS IS THE
-                      OFFICIAL CLIENT'S OWN SELF-DERIVED ADDRESS — NOTE: POLYMARKET.COM'S OWN "CASH"
-                      BALANCE MAY LIVE AT A DIFFERENT, WEBSITE-MANAGED ADDRESS AND NOT REFLECT THIS
-                      ONE. VERIFY ON POLYGONSCAN BEFORE MOVING LARGER AMOUNTS.
+                      YOUR REAL POLYMARKET PROXY WALLET — CONFIRMED ON-CHAIN TO MATCH THE SITE'S CASH
+                      BALANCE. DEPOSITS/CONVERSIONS DONE ON POLYMARKET.COM LAND HERE.
                     </p>
                     {legacyBal > 0.5 && depositWallet?.toLowerCase() !== LEGACY_DEPOSIT_WALLET.toLowerCase() && (
                       <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">

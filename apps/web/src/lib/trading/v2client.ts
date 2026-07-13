@@ -1,6 +1,6 @@
 import { createSecureClient, production, forkEnvironmentConfig, relayerApiKey, type SecureClient } from "@polymarket/client";
 import { useApiAccess } from "../apiAccess";
-import { LEGACY_DEPOSIT_WALLET, USDC } from "./constants";
+import { POLY_PROXY_WALLET, LEGACY_DEPOSIT_WALLET, USDC } from "./constants";
 import { builderApiKeyBrowser } from "./builderAuth";
 import { signerFrom } from "@polymarket/client/viem";
 import type { WalletClient } from "viem";
@@ -31,19 +31,13 @@ let cache: { key: string; client: Promise<SecureClient> } | null = null;
 
 const DW_KEY = (addr: string) => `sentry.depositWallet.${addr.toLowerCase()}`;
 
-/** Deposit (trading) wallet derived for this EOA on a previous client
- *  handshake — lets passive UI show the trading wallet without a signature.
- *
- *  REVERTED 2026-07-13: briefly pinned this to POLY_PROXY_WALLET (the
- *  address from polymarket.com's "Transfer Crypto" modal), but on-chain
- *  balance there read $0 even after the site showed Cash $19.04 — that
- *  address is a transient deposit-intake, not a persistent balance holder.
- *  The client's OWN self-derived wallet (LEGACY_DEPOSIT_WALLET) already
- *  carries a maxed pUSD allowance to the v2 exchange from setupTrading
- *  Approvals() — strong evidence it IS the real v2 CLOB trading wallet. */
-export function cachedDepositWallet(address: string): `0x${string}` | null {
-  const v = localStorage.getItem(DW_KEY(address));
-  return v && v.startsWith("0x") ? (v as `0x${string}`) : null;
+/** The trading wallet SENTRY funds and trades from — pinned to the operator's
+ *  REAL Polymarket proxy wallet (POLY_PROXY_WALLET, confirmed on-chain: pUSD
+ *  balance matches the site's Cash exactly, plus an already-maxed v2-exchange
+ *  allowance). Two earlier guesses (self-derived SDK wallet, "Transfer
+ *  Crypto" modal address) were both wrong — see the comment in constants.ts. */
+export function cachedDepositWallet(_address: string): `0x${string}` | null {
+  return POLY_PROXY_WALLET;
 }
 
 export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promise<SecureClient> {
@@ -75,6 +69,7 @@ export function getV2Client(wallet: WalletClient, address: `0x${string}`): Promi
   const client = createSecureClient({
     signer: signerFrom(wallet),
     environment,
+    wallet: POLY_PROXY_WALLET,
     ...(auth ? { apiKey: auth } : {}),
   }).then((c) => {
     localStorage.setItem(DW_KEY(address.toLowerCase()), c.account.wallet);

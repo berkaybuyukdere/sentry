@@ -13,15 +13,20 @@ export const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296" as 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
 // Operator-specific wallets (baked; single-operator terminal — same policy as
-// the baked API keys in apiAccess.ts):
-// POLY_PROXY_WALLET — polymarket.com's own proxy for the operator's EOA
-// (0xd99b…1827). The website deposits/converts/trades through THIS address;
-// the v2 client must use the same one or balances live in two different
-// invisible places (learned the hard way — see LEGACY_DEPOSIT_WALLET).
-export const POLY_PROXY_WALLET = "0x1F6F8d1f06ec5dC4B575b33ECa448f3466F79886" as const;
+// the baked API keys in apiAccess.ts). Found by direct on-chain verification
+// after two wrong guesses — see sentry-terminal.md memory for the full chase:
+//   1. 0x0947b5…3514 (SDK self-derived) — had pUSD allowance but $0 pUSD balance
+//   2. 0x1F6F8d…9886 ("Transfer Crypto" modal address) — $0 on both tokens
+//   3. 0x5b3587…aba69 (THIS ONE) — copied from the user's own Polymarket
+//      profile page ("Copy address" on polymarket.com/@sentinelbb) — confirmed
+//      on-chain: pUSD balance $19.03 (matches site's Cash exactly) AND already
+//      carries a maxed pUSD allowance to the v2 exchange. This is the real,
+//      persistent Polymarket proxy/trading wallet for the operator's account.
+export const POLY_PROXY_WALLET = "0x5b3587e9c0650b1148d8419213c7a90ad96aba69" as const;
 // LEGACY_DEPOSIT_WALLET — the beta client's own depositWalletFactory
-// derivation (createSecureClient with `wallet` omitted). $18.96 USDC.e was
-// parked here on 2026-07-13; kept only so the recovery flow can pull it back.
+// derivation (createSecureClient with `wallet` omitted) — a DIFFERENT wallet
+// the consumer site never recognized. Kept only so the recovery flow can
+// pull back anything accidentally parked there again.
 export const LEGACY_DEPOSIT_WALLET = "0x0947b5923e2b8855045dc6de4519f1cdbcb73514" as const;
 
 export const CLOB_HOST = "https://clob.polymarket.com";
