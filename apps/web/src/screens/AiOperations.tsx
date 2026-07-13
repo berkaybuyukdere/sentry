@@ -89,9 +89,14 @@ function Desk() {
   const linkTradingWallet = async () => {
     if (!walletClient || !address) return;
     setLinking(true);
+    console.info("%c[SENTRY] linking trading wallet — authenticating + deposit-wallet setup…", "color:#59f");
     try {
-      await getV2Client(walletClient, address);
-      notify({ kind: "SYSTEM", title: "TRADING WALLET LINKED", body: "Deposit wallet derived — fund it to trade.", href: "/ai" });
+      const client = await getV2Client(walletClient, address);
+      console.info(
+        `%c[SENTRY] TRADING WALLET LINKED — signer ${client.account.signer} → wallet ${client.account.wallet} (${client.account.walletType})`,
+        "color:#3a5;font-weight:bold",
+      );
+      notify({ kind: "SYSTEM", title: "TRADING WALLET LINKED", body: `Deposit wallet ${client.account.wallet.slice(0, 10)}… ready — fund it to trade.`, href: "/ai" });
     } catch (e) {
       // full detail to console (debugFetch also prints the raw server body for
       // clob.polymarket.com/auth* and relayer-v2 calls made during this step)
