@@ -28,6 +28,7 @@ import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
 import { cachedDepositWallet } from "./trading/v2client";
 import { useSessionSigner, sessionAddress, sessionWalletClient } from "./trading/sessionSigner";
 import { signAndPlaceOrder, snapToTick } from "./trading/orders";
+import { readCtfShareBalance } from "./trading/ctfBalance";
 import { sendLiveMail, type LiveMailKpi } from "./liveMail";
 
 /**
@@ -274,6 +275,9 @@ interface DeskState {
   /** one-time TP/SL/deadline rebase for migrated positions — persisted so it
    *  survives reloads (merge-derived values alone never reach localStorage) */
   rebaseLivePosition: (decisionId: string, patch: Partial<LiveExecution>) => void;
+  /** drops a position with zero real on-chain balance — no proceeds are
+   *  known, so it is removed WITHOUT a liveClosed entry (never fabricate P&L) */
+  writeOffLivePosition: (decisionId: string) => void;
   startPaperSession: () => void;
   stopPaperSession: () => void;
   paperOpen: (p: PaperPosition) => void;
@@ -434,6 +438,11 @@ export const useAiDesk = create<DeskState>()(
       rebaseLivePosition: (decisionId, patch) =>
         set((s) => ({
           liveExecuted: s.liveExecuted.map((e) => (e.decisionId === decisionId ? { ...e, ...patch } : e)),
+        })),
+
+      writeOffLivePosition: (decisionId) =>
+        set((s) => ({
+          liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
         })),
 
       recordLiveClose: (decisionId, exitPrice, proceeds, exitFee, reason) =>
@@ -1835,6 +1844,7 @@ export function useAiDeskEngine() {
   const liveSlBreach = useRef(new Map<string, number>());
   const liveUnmanagedWarned = useRef(new Set<string>()); // one warning per stuck position
   const liveDustWarned = useRef(new Set<string>()); // one note per sub-$1 unsellable remainder
+  const liveReconcileMiss = useRef(new Map<string, number>()); // posId → consecutive on-chain-shortfall ticks
   useEffect(() => {
     if (config.executionMode !== "LIVE" || !desk.liveExecuted.length) return;
     if (!phantomWalletClient && !sessReady) return; // no signer available at all
@@ -1917,6 +1927,74 @@ export function useAiDeskEngine() {
               continue;
             }
             liveUnmanagedWarned.current.delete(p.decisionId);
+            // ground-truth reconciliation: p.shares is a LEDGER value, and a
+            // legacy recording bug (fixed alongside this) logged the
+            // pre-trade REQUESTED size instead of the confirmed fill —
+            // stale positions can still carry a stale, overstated count. A
+            // SELL sized off that overstated ledger requests more than the
+            // wallet actually holds and bounces "not enough balance" every
+            // tick forever (observed live). Check the real on-chain balance
+            // before every exit attempt and correct the ledger to match.
+            //
+            // Three safety layers on top of the raw read (adversarial review
+            // caught all three as real risks to a real position):
+            // 1. skip entirely for a position younger than 15s — a just-filled
+            //    BUY's ERC-1155 transfer may not be mined yet; reading 0 here
+            //    would be a false negative on real, freshly-owned shares.
+            // 2. require 2 CONSECUTIVE ticks agreeing on a shortfall before
+            //    acting (mirrors the SL-breach confirmation below) — a single
+            //    stale/lagging RPC read must never delete real money.
+            // 3. the balance is the wallet's TOTAL holding of this tokenId,
+            //    pooled across every LiveExecution entry that shares it —
+            //    subtract what siblings already claim before judging p short,
+            //    so selling one entry can never falsely zero out another.
+            const now2 = Math.floor(Date.now() / 1000);
+            if (now2 - p.ts < 15) {
+              liveReconcileMiss.current.delete(p.decisionId);
+            } else {
+              const makerWallet = cachedDepositWallet(wAddr);
+              let onChainShares: number | null = null;
+              if (makerWallet) {
+                try {
+                  onChainShares = await readCtfShareBalance(makerWallet, p.tokenId);
+                } catch {
+                  /* RPC hiccup — proceed on the ledgered value this tick */
+                }
+              }
+              if (onChainShares !== null) {
+                const siblingShares = open
+                  .filter((e) => e.decisionId !== p.decisionId && e.tokenId === p.tokenId && ownerOf(e) === owner)
+                  .reduce((s, e) => s + e.shares, 0);
+                const allocatable = Math.max(0, onChainShares - siblingShares);
+                if (allocatable < p.shares - 0.01) {
+                  const misses = (liveReconcileMiss.current.get(p.decisionId) ?? 0) + 1;
+                  liveReconcileMiss.current.set(p.decisionId, misses);
+                  if (misses >= 2) {
+                    liveReconcileMiss.current.delete(p.decisionId);
+                    if (allocatable < 0.01) {
+                      // nothing left to sell on-chain — write off without
+                      // fabricating a P&L (we don't know what actually
+                      // happened: stale estimate, redemption, fill
+                      // elsewhere). Stops the endless bounce loop honestly.
+                      desk.writeOffLivePosition(p.decisionId);
+                      notify({ kind: "SYSTEM", title: "POSITION RECONCILED — NO SHARES ON-CHAIN", body: `${p.question.slice(0, 56)} showed 0 on-chain balance (twice confirmed) for ${p.shares.toFixed(2)} ledgered shares — removed. Check Polymarket's own history if you need the real outcome.`, href: "/ai" });
+                      sendLiveMail({ kind: "FAULT", key: `reconcile-zero:${p.decisionId}`, title: "POSITION RECONCILED — 0 ON-CHAIN", detail: `Ledger showed ${p.shares.toFixed(2)} shares but the wallet holds 0 on-chain (twice confirmed). Removed from tracking; no P&L booked (unknown true outcome).`, market: p.question, outcome: p.outcome, kpi: liveMailKpi() });
+                    } else {
+                      const factor = allocatable / p.shares;
+                      desk.rebaseLivePosition(p.decisionId, {
+                        shares: allocatable,
+                        costUsd: p.costUsd * factor,
+                        feeUsd: p.feeUsd * factor,
+                        usd: p.usd * factor,
+                      });
+                      notify({ kind: "SYSTEM", title: "POSITION SIZE RECONCILED", body: `${p.question.slice(0, 56)} — ledger said ${p.shares.toFixed(2)} sh, wallet allocates ${allocatable.toFixed(2)} (twice confirmed). Corrected.`, href: "/ai" });
+                    }
+                  }
+                  continue; // re-evaluate this position fresh next tick
+                }
+                liveReconcileMiss.current.delete(p.decisionId);
+              }
+            }
             // fresh universe row is ground truth for order params — the stored
             // values may be migration defaults on pre-upgrade positions
             const mkt = universe?.find((m) => m.slug === p.slug);

@@ -16,6 +16,7 @@ import { useProvision } from "../lib/trading/provision";
 import { cachedDepositWallet, getV2Client, recoverLegacyFunds } from "../lib/trading/v2client";
 import { signAndPlaceOrder, snapToTick } from "../lib/trading/orders";
 import { useSessionSigner, sessionAddress, sessionWalletClient } from "../lib/trading/sessionSigner";
+import { readCtfShareBalance } from "../lib/trading/ctfBalance";
 import { sendLiveMail } from "../lib/liveMail";
 import { USDC, PUSD, LEGACY_DEPOSIT_WALLET, POLY_PROXY_WALLET } from "../lib/trading/constants";
 import {
@@ -258,6 +259,42 @@ function Desk() {
     }
     setClosingLive(p.decisionId);
     try {
+      // ground-truth reconciliation before attempting to sell — see the full
+      // story in aiDesk.ts's exit tick. Deliberately LESS aggressive here: a
+      // single click gets a single RPC read, so this path only ever RESIZES
+      // (never deletes) — write-offs need the tick's 2-consecutive-read
+      // confirmation, since a lone stale read must never erase real money on
+      // one click. A just-opened position (<15s) skips the check entirely —
+      // its on-chain transfer may simply not be mined yet.
+      let shares = p.shares;
+      if (Math.floor(Date.now() / 1000) - p.ts >= 15) {
+        const makerWallet = cachedDepositWallet(wAddr);
+        let onChainShares: number | null = null;
+        if (makerWallet) {
+          try {
+            onChainShares = await readCtfShareBalance(makerWallet, p.tokenId);
+          } catch {
+            /* RPC hiccup — proceed on the ledgered value */
+          }
+        }
+        if (onChainShares !== null) {
+          const siblingShares = desk.liveExecuted
+            .filter((e) => e.decisionId !== p.decisionId && e.tokenId === p.tokenId && (e.owner ?? phantomAddress?.toLowerCase()) === owner)
+            .reduce((s, e) => s + e.shares, 0);
+          const allocatable = Math.max(0, onChainShares - siblingShares);
+          if (allocatable < 0.01) {
+            notify({ kind: "SYSTEM", title: "CLOSE HELD — BALANCE READS 0 ON-CHAIN", body: "This may be a very recent fill still settling, or a stale ledger entry. The automatic exit engine double-checks and self-heals; try again shortly.", href: "/ai" });
+            return;
+          }
+          if (allocatable < p.shares - 0.01) {
+            const factor = allocatable / p.shares;
+            desk.rebaseLivePosition(p.decisionId, { shares: allocatable, costUsd: p.costUsd * factor, feeUsd: p.feeUsd * factor, usd: p.usd * factor });
+            shares = allocatable;
+            notify({ kind: "SYSTEM", title: "POSITION SIZE RECONCILED — RETRY CLOSE", body: `Ledger said ${p.shares.toFixed(2)} sh, wallet allocates ${allocatable.toFixed(2)}. Corrected — hit CLOSE again.`, href: "/ai" });
+            return;
+          }
+        }
+      }
       const book = await fetchOrderBook(p.tokenId);
       const stats = bookStats(book);
       // price the FAK off bids NEAR THE TOP of the book: estimateSell walks
@@ -268,7 +305,7 @@ function Desk() {
         return;
       }
       const bidFloor = Math.max(p.tickSize, stats.bestBid * 0.9);
-      const sellPreview = estimateSell(stats.bids.filter((b) => b.price >= bidFloor), p.shares);
+      const sellPreview = estimateSell(stats.bids.filter((b) => b.price >= bidFloor), shares);
       const sellShares = Math.floor(sellPreview.filledShares * 100) / 100;
       if (sellShares < 0.01) {
         notify({ kind: "SYSTEM", title: "CLOSE BLOCKED — NO REAL DEPTH", body: "No buyers near the top of the book; selling now would dump into junk bids. Try again when liquidity returns.", href: "/ai" });

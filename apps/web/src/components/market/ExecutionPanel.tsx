@@ -173,33 +173,77 @@ export function ExecutionPanel() {
             : Math.max(tick, est.price * 0.98 - tick)
           : (limitPrice ?? est.price);
       const snapped = snapToTick(price, tick);
-      const shares = Math.floor((side === "BUY" ? usd / snapped : usd) * 100) / 100;
+      const requestedShares = Math.floor((side === "BUY" ? usd / snapped : usd) * 100) / 100;
       const res = await signAndPlaceOrder(walletClient, address, {
         tokenId,
         side,
         price: snapped,
-        shares,
+        shares: requestedShares,
         tickSize: tick,
         negRisk: market.negRisk,
         orderType: orderMode === "MARKET" ? "FAK" : "GTC",
       });
       setResult(res);
+      // ledger the CONFIRMED fill, not the pre-trade request — a market FAK
+      // can fill less than requested, and logging the request as fact was
+      // recording positions the wallet never actually held at that size
+      // (later SELLs would then try to sell more than it owns and bounce
+      // "not enough balance" forever). BUY and SELL responses are MIRRORS:
+      // BUY gives USDC (makingAmount) and receives shares (takingAmount);
+      // SELL gives shares (makingAmount) and receives USDC (takingAmount).
+      // A resting GTC order has no fill yet — keep the requested values.
+      let filledShares = requestedShares;
+      let filledUsd = side === "BUY" ? usd : requestedShares * snapped;
+      // an unconfirmed MARKET fill (res.success but status isn't "matched"
+      // and no amounts came back — a real, documented response shape) must
+      // NEVER fall back to the requested size: that IS the original bug this
+      // fix removes. Mark it unledgerable instead of guessing.
+      let fillUnconfirmed = false;
+      if (res.success && orderMode === "MARKET") {
+        const sharesField = side === "BUY" ? res.takingAmount : res.makingAmount;
+        const usdField = side === "BUY" ? res.makingAmount : res.takingAmount;
+        let sh = Number(sharesField);
+        if (Number.isFinite(sh) && sh > requestedShares * 1.05) sh = sh / 1e6;
+        if (!Number.isFinite(sh) || sh <= 0) {
+          if (res.status === "matched") sh = requestedShares; // matched but amounts absent
+          else fillUnconfirmed = true;
+        } else {
+          sh = Math.min(sh, requestedShares);
+        }
+        if (!fillUnconfirmed && Number.isFinite(sh) && sh > 0) {
+          let dollars = Number(usdField);
+          if (Number.isFinite(dollars) && dollars > sh * 1.05) dollars = dollars / 1e6;
+          if (!Number.isFinite(dollars) || dollars <= 0 || dollars > sh * 1.05) dollars = sh * snapped;
+          filledShares = sh;
+          filledUsd = dollars;
+        }
+      }
       const entry = logOrder({
         market: market.question,
         slug: market.slug,
         side,
         outcome,
-        price: snapped,
-        shares,
-        usd: side === "BUY" ? usd : shares * snapped,
+        price: filledShares > 0 ? filledUsd / filledShares : snapped,
+        shares: filledShares,
+        usd: filledUsd,
         orderType: orderMode === "MARKET" ? "FAK" : "GTC",
         clobOrderId: res.orderID ?? null,
         txHash: res.transactionsHashes?.[0] ?? null,
         status: res.status ?? (res.success ? "SUBMITTED" : "REJECTED"),
-        error: res.errorMsg || null,
+        // an unconfirmed fill is marked as an "error" purely so the desk's
+        // order-log matcher (which requires !o.error) never ledgers a guess
+        error: !res.success ? res.errorMsg || "rejected" : fillUnconfirmed ? `unconfirmed fill (status: ${res.status ?? "unknown"}) — not ledgered` : null,
         signer: address?.toLowerCase(),
       });
-      if (res.success) {
+      if (res.success && fillUnconfirmed) {
+        setPhase("done");
+        notify({
+          kind: "SYSTEM",
+          title: "ORDER STATUS UNKNOWN",
+          body: `${side} ${outcome} · ${market.question} — accepted (${res.status ?? "pending"}) but no fill confirmed yet. Check the Orders screen before assuming it filled.`,
+          href: "/orders",
+        });
+      } else if (res.success) {
         setPhase("done");
         accrue(fee, {
           market: market.question,
@@ -209,7 +253,7 @@ export function ExecutionPanel() {
         notify({
           kind: "ORDER",
           title: "ORDER CONFIRMED",
-          body: `${side} ${outcome} · ${market.question} · ${fmt.usd(side === "BUY" ? usd : shares * snapped)} @ ${(snapped * 100).toFixed(1)}¢ · POSITION ID ${entry.id}`,
+          body: `${side} ${outcome} · ${market.question} · ${fmt.usd(filledUsd)} @ ${(snapped * 100).toFixed(1)}¢ · POSITION ID ${entry.id}`,
           href: "/orders",
         });
       } else {
