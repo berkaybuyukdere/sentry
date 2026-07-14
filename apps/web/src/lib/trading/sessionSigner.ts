@@ -38,6 +38,10 @@ interface SessionSignerState {
   generate: () => `0x${string}`;
   importKey: (pk: string) => `0x${string}` | null;
   setProxyWallet: (a: string) => boolean;
+  /** un-links the proxy without destroying the key — lets the operator
+   *  correct a bad link (e.g. pasted someone else's proxy) without having
+   *  to regenerate/re-import the whole signer */
+  clearProxy: () => void;
   setEnabled: (v: boolean) => void;
   clear: () => void;
 }
@@ -82,6 +86,8 @@ export const useSessionSigner = create<SessionSignerState>()(
         const { pk, proxyWallet } = get();
         set({ enabled: enabled && !!pk && !!proxyWallet });
       },
+
+      clearProxy: () => set({ proxyWallet: null, enabled: false }),
 
       clear: () => set({ pk: null, proxyWallet: null, enabled: false }),
     }),

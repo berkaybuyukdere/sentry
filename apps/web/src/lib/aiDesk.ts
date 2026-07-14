@@ -24,7 +24,7 @@ import { useTicket } from "../components/market/ticket";
 import { useOrderLog } from "./trading/orderLog";
 import { useLiveRef, cryptoAlignment, type RefRow } from "./liveRef";
 import { useSmartFlow, type SmartBuy } from "./smartFlow";
-import { USDC, PUSD, ERC20_ABI } from "./trading/constants";
+import { USDC, PUSD, ERC20_ABI, POLY_PROXY_WALLET } from "./trading/constants";
 import { cachedDepositWallet } from "./trading/v2client";
 import { useSessionSigner, sessionAddress, sessionWalletClient } from "./trading/sessionSigner";
 import { signAndPlaceOrder, snapToTick } from "./trading/orders";
@@ -1132,8 +1132,20 @@ export function useAiDeskEngine() {
   // session account — its proxy holds the bankroll and its key signs exits —
   // so every read and every order routes through it instead of Phantom.
   const sess = useSessionSigner();
-  const autoOn = sess.enabled && !!sess.pk && !!sess.proxyWallet;
   const { address: phantomAddress } = useAccount();
+  // POLY_PROXY_WALLET is confirmed-authorized ONLY for the main EOA — a
+  // burner signer linked to it (e.g. the wrong address pasted by hand) can
+  // never place an accepted order ("does not match auth"/maker mismatch)
+  // every single attempt. Refuse to consider autopilot armed in that state
+  // rather than repeatedly signing doomed orders with no visible reason.
+  const sessAddrForCheck = sess.pk ? sessionAddress() : null;
+  const proxyOwnedByOther =
+    !!sess.proxyWallet &&
+    sess.proxyWallet.toLowerCase() === POLY_PROXY_WALLET.toLowerCase() &&
+    !!sessAddrForCheck &&
+    !!phantomAddress &&
+    sessAddrForCheck.toLowerCase() !== phantomAddress.toLowerCase();
+  const autoOn = sess.enabled && !!sess.pk && !!sess.proxyWallet && !proxyOwnedByOther;
   const liveAddress = autoOn ? (sessionAddress() ?? undefined) : phantomAddress;
   const liveTarget = liveAddress ? (cachedDepositWallet(liveAddress) ?? liveAddress) : undefined;
   // position ownership: exits, P&L and the cash floor are all PER-IDENTITY.
@@ -1608,6 +1620,10 @@ export function useAiDeskEngine() {
     // desk looks idle despite EV-positive candidates in the decision feed
     const status = (s: string | null) => desk.setLiveAutoStatus(s);
     if (config.executionMode !== "LIVE") return;
+    if (proxyOwnedByOther) {
+      status("AUTOPILOT MISCONFIGURED — LINKED PROXY BELONGS TO A DIFFERENT WALLET. CLEAR IT IN THE AUTOPILOT SIGNER PANEL AND RELINK.");
+      return;
+    }
     if (!autoOn) {
       status("AUTOPILOT NOT ARMED — ENTRIES WAIT FOR A MANUAL WALLET PROMPT");
       return;

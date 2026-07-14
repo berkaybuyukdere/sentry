@@ -1300,6 +1300,17 @@ function AutopilotSignerPanel() {
   // sell them; destroying it while they're open strands real money forever
   const sessionOwnedOpen = addr ? liveOpen.filter((e) => e.owner === addr.toLowerCase()) : [];
   const phantomOwnedOpen = liveOpen.filter((e) => !addr || e.owner !== addr.toLowerCase());
+  // POLY_PROXY_WALLET is authorized ONLY for the main EOA (confirmed on-chain,
+  // v21) — linking it to any OTHER signer produces an order the exchange can
+  // never accept ("does not match auth"/maker mismatch), every single time.
+  // This exact mistake happens when a burner key gets the main account's own
+  // proxy pasted into it by hand (e.g. copied from the TRADING WALLET panel).
+  const proxyMismatch =
+    !!addr &&
+    !!connectedAddress &&
+    !!sess.proxyWallet &&
+    sess.proxyWallet.toLowerCase() === POLY_PROXY_WALLET.toLowerCase() &&
+    addr.toLowerCase() !== connectedAddress.toLowerCase();
 
   return (
     <div className={cx("border px-2.5 py-2", armed ? "border-pos/50 bg-pos/[0.05]" : "border-line bg-raise")}>
@@ -1410,6 +1421,24 @@ function AutopilotSignerPanel() {
                   size="sm"
                   variant="ghost"
                   onClick={() => {
+                    // this specific proxy is confirmed authorized ONLY for the
+                    // main EOA — linking it to any other signer can NEVER
+                    // place an order the exchange will accept, so refuse
+                    // before the operator wastes a cycle finding out the hard way
+                    if (
+                      addr &&
+                      connectedAddress &&
+                      addr.toLowerCase() !== connectedAddress.toLowerCase() &&
+                      proxyVal.trim().toLowerCase() === POLY_PROXY_WALLET.toLowerCase()
+                    ) {
+                      notify({
+                        kind: "SYSTEM",
+                        title: "WRONG PROXY — BELONGS TO YOUR MAIN ACCOUNT",
+                        body: "That address is your MAIN wallet's own trading proxy — this burner key has no authority over it; every order would bounce. Either import your MAIN Phantom private key above instead, or deposit into a NEW Polymarket account logged in as THIS key's own address and paste ITS OWN profile proxy.",
+                        href: "/ai",
+                      });
+                      return;
+                    }
                     if (sess.setProxyWallet(proxyVal)) {
                       setProxyVal("");
                       notify({ kind: "SYSTEM", title: "AUTOPILOT PROXY LINKED", body: "Session trading wallet set — ARM to trade with zero prompts.", href: "/ai" });
@@ -1421,6 +1450,24 @@ function AutopilotSignerPanel() {
                   LINK
                 </Btn>
               </div>
+            </>
+          ) : proxyMismatch ? (
+            <>
+              <div className="mono-num mt-1 text-[9.5px] tabular-nums text-neg2">
+                PROXY {sess.proxyWallet.slice(0, 8)}…{sess.proxyWallet.slice(-6)} — WRONG WALLET
+              </div>
+              <p className="mt-1 text-[9px] leading-relaxed text-neg2">
+                THIS IS YOUR MAIN ACCOUNT'S OWN TRADING PROXY — THIS BURNER KEY HAS NO AUTHORITY
+                OVER IT. EVERY ORDER WILL BOUNCE ("DOES NOT MATCH") FOREVER UNTIL THIS IS FIXED.
+                CLEAR IT, THEN EITHER IMPORT YOUR MAIN PHANTOM PRIVATE KEY ABOVE (FASTEST), OR
+                DEPOSIT INTO A NEW POLYMARKET ACCOUNT AS THIS KEY'S OWN ADDRESS AND LINK ITS OWN PROXY.
+              </p>
+              <button
+                onClick={() => sess.clearProxy()}
+                className="focus-outline mt-1.5 flex h-7 w-full items-center justify-center border border-neg/40 bg-neg/5 text-[9px] font-medium uppercase tracking-[0.1em] text-neg2 transition-colors hover:bg-neg/10"
+              >
+                CLEAR WRONG PROXY
+              </button>
             </>
           ) : (
             <div className="mono-num mt-1 flex items-center justify-between text-[9.5px] tabular-nums">
