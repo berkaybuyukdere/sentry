@@ -1843,6 +1843,7 @@ export function useAiDeskEngine() {
   const liveClosing = useRef(false);
   const liveSlBreach = useRef(new Map<string, number>());
   const liveUnmanagedWarned = useRef(new Set<string>()); // one warning per stuck position
+  const liveUnmanagedMiss = useRef(new Map<string, number>()); // posId → consecutive no-signer ticks
   const liveDustWarned = useRef(new Set<string>()); // one note per sub-$1 unsellable remainder
   const liveReconcileMiss = useRef(new Map<string, number>()); // posId → consecutive on-chain-shortfall ticks
   useEffect(() => {
@@ -1905,8 +1906,13 @@ export function useAiDeskEngine() {
             if (!wClient || !wAddr || (owner !== null && wAddr.toLowerCase() !== owner)) {
               // owning wallet unavailable — hold, but NEVER silently: an
               // exit trigger with no signer means TP/SL protection is dead
-              // for this position until that wallet comes back
-              if (!liveUnmanagedWarned.current.has(p.decisionId)) {
+              // for this position until that wallet comes back. Requires 2
+              // CONSECUTIVE ticks before warning (~10s) — a page-just-loaded
+              // wagmi connector takes a tick or two to hydrate, and warning
+              // on that transient blip is a false alarm every single reload.
+              const misses = (liveUnmanagedMiss.current.get(p.decisionId) ?? 0) + 1;
+              liveUnmanagedMiss.current.set(p.decisionId, misses);
+              if (misses >= 2 && !liveUnmanagedWarned.current.has(p.decisionId)) {
                 liveUnmanagedWarned.current.add(p.decisionId);
                 notify({
                   kind: "SYSTEM",
@@ -1926,6 +1932,7 @@ export function useAiDeskEngine() {
               }
               continue;
             }
+            liveUnmanagedMiss.current.delete(p.decisionId);
             liveUnmanagedWarned.current.delete(p.decisionId);
             // ground-truth reconciliation: p.shares is a LEDGER value, and a
             // legacy recording bug (fixed alongside this) logged the

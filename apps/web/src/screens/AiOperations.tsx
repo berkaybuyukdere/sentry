@@ -207,6 +207,13 @@ function Desk() {
     const owner = e.owner ?? phantomAddress?.toLowerCase();
     return !!address && owner === address.toLowerCase();
   };
+  // with autopilot armed, "connected"/"chainId" below still describe PHANTOM
+  // specifically (the session signer is an in-memory key, not a wagmi
+  // connector) — any position NOT owned by the active identity still needs
+  // Phantom itself connected + on Polygon for its own exits to sign. Hiding
+  // the network/connect banners just because autopilot is armed was leaving
+  // those positions unprotected with no visible warning.
+  const hasOtherWalletPositions = desk.liveExecuted.some((e) => !kpiOwned(e));
   const liveDeployed = desk.liveExecuted.filter(kpiOwned).reduce((s, e) => s + e.costUsd, 0);
   const liveUnrealized = desk.liveExecuted.filter(kpiOwned).reduce(
     (s, e) => s + (markOf(e.tokenId, e.entryPrice) - e.entryPrice) * e.shares,
@@ -450,17 +457,21 @@ function Desk() {
             </p>
           </Field>
 
-          {!paperMode && !autoSign && isConnected && chainId !== polygon.id && (
+          {!paperMode && (!autoSign || hasOtherWalletPositions) && isConnected && chainId !== polygon.id && (
             <button
               onClick={() => switchChain({ chainId: polygon.id })}
               className="focus-outline border border-warn/50 bg-warn/10 px-2.5 py-2 text-left text-[9.5px] uppercase leading-relaxed tracking-[0.08em] text-warn2 transition-colors hover:bg-warn/20"
             >
-              WALLET ON WRONG NETWORK — TAP TO SWITCH TO POLYGON. PHANTOM: USE ITS POLYGON (EVM) SIDE; SOL ON SOLANA MUST BE BRIDGED/SWAPPED TO POLYGON USDC — POLYMARKET SETTLES ON POLYGON ONLY.
+              {autoSign
+                ? "PHANTOM ON WRONG NETWORK — TAP TO SWITCH. YOUR MAIN-WALLET POSITIONS' EXITS CAN'T SIGN UNTIL IT'S ON POLYGON."
+                : "WALLET ON WRONG NETWORK — TAP TO SWITCH TO POLYGON. PHANTOM: USE ITS POLYGON (EVM) SIDE; SOL ON SOLANA MUST BE BRIDGED/SWAPPED TO POLYGON USDC — POLYMARKET SETTLES ON POLYGON ONLY."}
             </button>
           )}
-          {!paperMode && !autoSign && !isConnected && (
+          {!paperMode && (!autoSign || hasOtherWalletPositions) && !isConnected && (
             <div className="border border-line bg-raise px-2.5 py-2 text-[9.5px] uppercase leading-relaxed tracking-[0.08em] text-dim">
-              NO WALLET CONNECTED — LIVE ORDERS NEED A POLYGON SIGNATURE. PHANTOM SUPPORTED VIA ITS POLYGON (EVM) SIDE.
+              {autoSign
+                ? "PHANTOM NOT CONNECTED — YOUR MAIN-WALLET POSITIONS' EXITS NEED IT RECONNECTED TO SIGN."
+                : "NO WALLET CONNECTED — LIVE ORDERS NEED A POLYGON SIGNATURE. PHANTOM SUPPORTED VIA ITS POLYGON (EVM) SIDE."}
             </div>
           )}
           {!paperMode && isConnected && chainId === polygon.id && (
@@ -1075,6 +1086,10 @@ function Desk() {
                     {desk.liveExecuted.map((p) => {
                       const mark = markOf(p.tokenId, p.entryPrice);
                       const pnl = (mark - p.entryPrice) * p.shares;
+                      // below the exchange's own $1 order minimum — no CLOSE
+                      // attempt can ever succeed; say so instead of offering
+                      // a button that only bounces "not enough" every click
+                      const isDust = p.shares * mark < 1.02;
                       return (
                         <tr key={p.decisionId} className="hairline-b h-10 row-hover">
                           <td className="max-w-0 truncate px-3 text-[11.5px] text-text">
@@ -1093,9 +1108,15 @@ function Desk() {
                           </td>
                           <td className="mono-num px-2 text-right text-[10px] text-faint">{fmt.timeAgo(p.ts)}</td>
                           <td className="px-2 text-right">
-                            <Btn size="sm" variant="ghost" disabled={closingLive === p.decisionId} onClick={() => void manualCloseLive(p)}>
-                              {closingLive === p.decisionId ? "CLOSING…" : "CLOSE"}
-                            </Btn>
+                            {isDust ? (
+                              <span className="label-faint text-[9px] text-faint" title="Below the exchange's $1 order minimum — rides to resolution.">
+                                DUST
+                              </span>
+                            ) : (
+                              <Btn size="sm" variant="ghost" disabled={closingLive === p.decisionId} onClick={() => void manualCloseLive(p)}>
+                                {closingLive === p.decisionId ? "CLOSING…" : "CLOSE"}
+                              </Btn>
+                            )}
                           </td>
                         </tr>
                       );
