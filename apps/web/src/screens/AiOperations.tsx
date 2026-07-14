@@ -64,7 +64,7 @@ function TierGate() {
 
 function Desk() {
   const desk = useAiDesk();
-  const { config, engaged, haltReason, decisions, paper, aiStatus, scan } = desk;
+  const { config, engaged, haltReason, decisions, paper, aiStatus, liveAutoStatus, scan } = desk;
   const { data: markets } = useMarkets({ limit: 400 }, 45_000);
   const { data: deskUniverse } = useDeskUniverse(25_000);
   const { isConnected, chainId } = useAccount();
@@ -1002,6 +1002,11 @@ function Desk() {
             </div>
           )}
           {aiStatus && <div className="mono-num mt-2 text-[9.5px] uppercase tracking-[0.08em] text-accent2">{aiStatus}</div>}
+          {!paperMode && liveAutoStatus && (
+            <div className="mono-num mt-2 border border-warn/30 bg-warn/5 px-2.5 py-1.5 text-[9.5px] uppercase leading-relaxed tracking-[0.08em] text-warn2">
+              AUTOPILOT — {liveAutoStatus}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-3 gap-px bg-line p-px">

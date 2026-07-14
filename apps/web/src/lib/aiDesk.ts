@@ -253,6 +253,9 @@ interface DeskState {
   lockedProfitUsd: number;
   decisions: DeskDecision[];
   aiStatus: string | null;
+  /** why the LIVE autopilot fast-entry pass did or didn't act this cycle —
+   *  every early-return states its reason here instead of failing silently */
+  liveAutoStatus: string | null;
   paper: PaperSession;
   scan: ScanStats;
   liveExecuted: LiveExecution[];
@@ -283,6 +286,7 @@ interface DeskState {
   paperOpen: (p: PaperPosition) => void;
   paperClose: (positionId: string, exitPrice: number, proceeds: number, exitFee: number, reason: ClosedTrade["reason"]) => void;
   setAiStatus: (s: string | null) => void;
+  setLiveAutoStatus: (s: string | null) => void;
   resetDecisions: () => void;
 }
 
@@ -375,6 +379,7 @@ export const useAiDesk = create<DeskState>()(
       lockedProfitUsd: 0,
       decisions: [],
       aiStatus: null,
+      liveAutoStatus: null,
       paper: EMPTY_PAPER,
       scan: EMPTY_SCAN,
       liveExecuted: [],
@@ -573,6 +578,7 @@ export const useAiDesk = create<DeskState>()(
         }),
 
       setAiStatus: (aiStatus) => set({ aiStatus }),
+      setLiveAutoStatus: (liveAutoStatus) => set({ liveAutoStatus }),
       resetDecisions: () => set({ decisions: [], scan: EMPTY_SCAN, haltReason: null }),
     }),
     {
@@ -1597,18 +1603,47 @@ export function useAiDeskEngine() {
   // stage delay. Only runs when the autopilot signer is armed.
   const liveOpening = useRef(false);
   useEffect(() => {
-    if (!autoOn || !engaged || config.executionMode !== "LIVE" || config.mode !== "ARM") return;
-    if (liveOpening.current || liveClosing.current) return;
+    // every early return states WHY here instead of failing silently — the
+    // operator reads this instead of opening devtools to find out why the
+    // desk looks idle despite EV-positive candidates in the decision feed
+    const status = (s: string | null) => desk.setLiveAutoStatus(s);
+    if (config.executionMode !== "LIVE") return;
+    if (!autoOn) {
+      status("AUTOPILOT NOT ARMED — ENTRIES WAIT FOR A MANUAL WALLET PROMPT");
+      return;
+    }
+    if (!engaged) {
+      status("DESK STANDING DOWN — ENGAGE TO RESUME AUTOPILOT ENTRIES");
+      return;
+    }
+    if (config.mode !== "ARM") {
+      status("STAGING MODE IS ADVISE — SWITCH TO ARM FOR AUTOPILOT TO ENTER AUTOMATICALLY");
+      return;
+    }
+    if (liveOpening.current || liveClosing.current) return; // mid-cycle, leave prior status showing
     const wClient = sessionWalletClient();
     const wAddr = sessionAddress();
-    if (!wClient || !wAddr || liveCash === null) return; // fail closed on unknown balance
+    if (!wClient || !wAddr || liveCash === null) {
+      status("WALLET BALANCE UNKNOWN — RETRYING (RPC OR SESSION SIGNER NOT READY)");
+      return;
+    }
     const owned = desk.liveExecuted.filter(ownedByLive);
     const slots = effCfg.maxPositions - owned.length;
-    if (slots <= 0) return;
+    if (slots <= 0) {
+      status(`MAX POSITIONS REACHED (${owned.length}/${effCfg.maxPositions}) — WAITING FOR AN EXIT TO FREE A SLOT`);
+      return;
+    }
     // spendable = cash above the profit-lock floor; the ladder caps how much
     // of the bank may be in the market at once (expands as profit accrues)
     const spendableCash = liveCashFloor !== null ? liveCash - liveCashFloor : liveCash;
-    if (spendableCash < effCfg.minTradeUsd) return;
+    if (spendableCash < effCfg.minTradeUsd) {
+      status(
+        liveCashFloor !== null
+          ? `CASH BELOW THE MIN CLIP AFTER THE PROFIT-LOCK FLOOR (SPENDABLE $${spendableCash.toFixed(2)} < $${effCfg.minTradeUsd.toFixed(2)})`
+          : `CASH BELOW MIN CLIP ($${spendableCash.toFixed(2)} < $${effCfg.minTradeUsd.toFixed(2)}) — FUND THE TRADING WALLET`,
+      );
+      return;
+    }
     const baseline = desk.liveBaseline ?? liveCash;
     // ownerless legacy trades belong to Phantom (mirror ownerOf), NOT the
     // session identity — attributing them to a burner would skew its ladder
@@ -1619,20 +1654,34 @@ export function useAiDeskEngine() {
     const deployedCost = owned.reduce((s, e) => s + e.costUsd, 0);
     const ladderUsd = Math.max(capFrac * baseline, Math.min(2 * effCfg.minTradeUsd, 0.5 * baseline));
     let headroom = Math.min(ladderUsd - deployedCost, spendableCash);
-    if (headroom < effCfg.minTradeUsd) return;
+    if (headroom < effCfg.minTradeUsd) {
+      status(`DEPLOYMENT LADDER FULL THIS CYCLE ($${deployedCost.toFixed(2)} of $${ladderUsd.toFixed(2)} ladder deployed) — EXPANDS AS PROFIT ACCRUES`);
+      return;
+    }
     const perCycle = realizedOwned < -0.02 * baseline ? Math.max(1, Math.floor(tempo.entriesPerCycle / 2)) : tempo.entriesPerCycle;
     const openSlugs = new Set(owned.map((e) => e.slug));
-    const batch = decisions
-      .filter((d) => d.status === "PROPOSED" && d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
+    const candidates = decisions.filter((d) => d.status === "PROPOSED");
+    const batch = candidates
+      .filter((d) => d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
       .filter((d) => !openSlugs.has(d.slug)) // never double-enter the same market
       .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)
       .slice(0, Math.min(perCycle, slots));
-    if (!batch.length) return;
+    if (!batch.length) {
+      status(
+        !candidates.length
+          ? "NO PROPOSED DECISIONS THIS SWEEP — WAITING FOR THE NEXT CYCLE"
+          : `${candidates.length} PROPOSED, 0 CLEARED THE ELIGIBILITY FILTER (REAL-SIGNAL BACKING + EV>0 + NOT ALREADY HELD) THIS CYCLE`,
+      );
+      return;
+    }
+    status(null); // clear — about to act
 
     liveOpening.current = true;
     (async () => {
       try {
         let cashLeft = headroom;
+        let filledCount = 0;
+        let lastSkipReason: string | null = null;
         for (const next of batch) {
           if (cashLeft < effCfg.minTradeUsd) break;
           const market = universe?.find((m) => m.slug === next.slug);
@@ -1652,6 +1701,7 @@ export function useAiDeskEngine() {
             const spend = Math.min(next.sizeUsd, cashLeft, headroom, tightDepth * 0.5);
             if (spend < effCfg.minTradeUsd) {
               useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              lastSkipReason = `${next.question.slice(0, 40)} — book too thin within 1% of ask for a viable clip`;
               continue;
             }
             const fill = estimateFill(stats.asks, spend);
@@ -1659,6 +1709,7 @@ export function useAiDeskEngine() {
             // walk guard: never pay >1% above the QUOTED best ask
             if (fill.shares <= 0 || fill.avgPrice <= 0 || fill.avgPrice > askRef * 1.01) {
               useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              lastSkipReason = `${next.question.slice(0, 40)} — fill would walk >1% past the quoted ask`;
               continue;
             }
             const tick = market.tickSize;
@@ -1666,6 +1717,7 @@ export function useAiDeskEngine() {
             const shares = Math.floor((spend / limit) * 100) / 100;
             if (shares < 0.01) {
               useAiDesk.getState().setDecisionStatus(next.id, "SKIPPED");
+              lastSkipReason = `${next.question.slice(0, 40)} — clip rounds to under 0.01 shares`;
               continue;
             }
             const res = await signAndPlaceOrder(wClient, wAddr, {
@@ -1684,8 +1736,10 @@ export function useAiDeskEngine() {
                 useSessionSigner.getState().setEnabled(false);
                 notify({ kind: "SYSTEM", title: "AUTOPILOT PAUSED — CONFIG FAULT", body: res.errorMsg.slice(0, 140), href: "/ai" });
                 sendLiveMail({ kind: "FAULT", key: `autofault:${res.errorMsg.slice(0, 50)}`, title: "AUTOPILOT PAUSED — CONFIG FAULT", detail: `Session-signed entry failed unrecoverably: ${res.errorMsg.slice(0, 160)}` });
+                status(`AUTOPILOT DISARMED — CONFIG FAULT: ${res.errorMsg.slice(0, 100)}`);
                 break;
               }
+              lastSkipReason = `${next.question.slice(0, 40)} — order rejected: ${(res.errorMsg ?? "no match").slice(0, 60)}`;
               continue; // transient (no match / thin book) — next candidate
             }
             // confirmed-fill accounting. A BUY response is the MIRROR of a
@@ -1744,6 +1798,7 @@ export function useAiDeskEngine() {
             accrue(feeQuote, { market: next.question, notionalUsd: costUsd });
             cashLeft -= costUsd + feeQuote.feeUsd;
             headroom -= costUsd;
+            filledCount += 1;
             notify({
               kind: "ORDER",
               title: "AI DESK — LIVE FILL",
@@ -1762,9 +1817,15 @@ export function useAiDeskEngine() {
               reasons: next.reasons.slice(0, 4),
               kpi: liveMailKpi(),
             });
-          } catch {
+          } catch (e) {
+            lastSkipReason = `${next.question.slice(0, 40)} — ${e instanceof Error ? e.message.slice(0, 60) : "book/order fault"}`;
             /* book/order fault — next candidate */
           }
+        }
+        if (filledCount > 0) {
+          status(`FILLED ${filledCount} ENTR${filledCount === 1 ? "Y" : "IES"} THIS PASS`);
+        } else if (lastSkipReason) {
+          status(`ALL ${batch.length} CANDIDATE${batch.length === 1 ? "" : "S"} SKIPPED — ${lastSkipReason}`);
         }
       } finally {
         liveOpening.current = false;
