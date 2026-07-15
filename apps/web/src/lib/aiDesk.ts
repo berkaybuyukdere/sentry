@@ -722,20 +722,29 @@ export function deployCapFrac(realizedPnl: number, capital: number): number {
 
 /**
  * Trailing-stop price for a position that has cleared its profit-activation
- * level. Winners are NOT capped by a fixed take-profit — instead the stop
- * ratchets up under the running peak, giving back at most HALF the peak gain
- * (capped at 8% of price so a near-resolution position has room to breathe),
- * and floored just above breakeven so an activated winner can never turn into
- * a loss. As the peak rises the stop rises with it and never falls back; a
- * genuine runner rides all the way toward $1 resolution.
+ * level. Winners are NOT capped by a fixed take-profit — the stop ratchets up
+ * under the running peak and the runner rides toward $1 resolution.
  *
- *   entry 0.52, peak 0.56 → giveback min(0.02, 0.045)=0.02 → stop 0.54  (+3.8%)
- *   entry 0.52, peak 0.80 → giveback min(0.14, 0.064)=0.064 → stop 0.736 (+41%)
- *   entry 0.52, peak 0.95 → giveback min(0.215, 0.076)=0.076 → stop 0.874 (+68%)
+ * The giveback has a MINIMUM BREATHING ROOM of max(2.5¢, 4% of price): right
+ * after activation the gain is tiny, and "half the gain" made the trail so
+ * tight that ordinary mid-wobble stopped runners out with +$0.05 scraps
+ * (observed live) — often below the old fixed TP. With the room floor, the
+ * trail starts AT BREAKEVEN (full room to run; the net-positive sell gate
+ * means the worst case is a small net-positive scratch, never a loss) and
+ * only starts locking profit once the gain outgrows the noise:
+ *
+ *   entry 0.713, peak 0.742 → trail 0.714 (breakeven — run free)
+ *   entry 0.713, peak 0.780 → trail 0.746 (locks ~the old +4% TP)
+ *   entry 0.713, peak 0.850 → trail 0.782 (+7¢ locked)
+ *   entry 0.713, peak 0.950 → trail 0.855 (+14¢ locked, still riding)
+ *
+ * The hard stop-loss floor stays armed independently — this function only
+ * governs the profit side.
  */
 export function trailingStopPrice(entryPrice: number, peakMark: number): number {
   const gain = Math.max(0, peakMark - entryPrice);
-  const giveback = Math.min(0.5 * gain, 0.08 * peakMark);
+  const room = Math.max(0.025, 0.04 * peakMark);
+  const giveback = Math.min(Math.max(room, 0.5 * gain), 0.1 * peakMark);
   return Math.max(entryPrice * 1.002, peakMark - giveback);
 }
 
