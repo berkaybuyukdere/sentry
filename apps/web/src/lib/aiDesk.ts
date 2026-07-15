@@ -1121,6 +1121,7 @@ export function useAiDeskEngine() {
   const opening = useRef(false);
   const closing = useRef(false);
   const slBreach = useRef(new Map<string, number>()); // posId → consecutive SL ticks
+  const paperCapitTicks = useRef(new Map<string, number>()); // posId → healthy-book ticks below the SL floor
   const startLiveRef = useLiveRef((s) => s.start);
   const cryptoRows = useLiveRef((s) => s.rows);
   const startSmartFlow = useSmartFlow((s) => s.start);
@@ -1437,6 +1438,11 @@ export function useAiDeskEngine() {
             stats && stats.bestBid !== null && stats.bestAsk !== null
               ? (stats.bestBid + stats.bestAsk) / 2
               : markOf(p.tokenId, p.entryPrice);
+          // dislocated book (bids pulled → phantom mid collapse): freeze the
+          // position this tick — mirrors the LIVE exit tick exactly so paper
+          // stays an honest predictor of live behavior
+          const pSpread = stats && stats.bestBid !== null && stats.bestAsk !== null ? stats.bestAsk - stats.bestBid : null;
+          if (pSpread !== null && pSpread > Math.max(0.1, mark * 0.4)) continue;
           const hitTp = mark >= p.tpPrice;
           const hitTime = now >= p.deadline;
           // stop-loss needs TWO consecutive breaching ticks (~8s) of the real
@@ -1449,7 +1455,10 @@ export function useAiDeskEngine() {
           } else {
             slBreach.current.delete(p.id);
           }
-          if (!hitTp && !hitSl && !hitTime) continue;
+          if (!hitTp && !hitSl && !hitTime) {
+            paperCapitTicks.current.delete(p.id);
+            continue;
+          }
           if (!stats) continue; // book unavailable — retry next tick
           const sell = estimateSell(stats.bids, p.shares);
           const exitPrice = sell.filledShares > 0 ? sell.avgPrice : mark;
@@ -1460,7 +1469,21 @@ export function useAiDeskEngine() {
           // loss, hold — the mid ran ahead of exit liquidity. Stop-loss and
           // the deadline still guard the downside.
           if (reason === "TAKE_PROFIT" && proceeds - exitFee - p.costUsd - p.feeUsd <= 0) continue;
+          // stop-limit band (mirrors LIVE): never dump through a gapped stop;
+          // exit below the band only after ~3 healthy-book confirmations
+          if (reason !== "TAKE_PROFIT") {
+            const slFloor = Math.max(0.01, p.slPrice - Math.max(0.04, p.slPrice * 0.12));
+            if (exitPrice < slFloor) {
+              const healthy = pSpread !== null && pSpread <= Math.max(0.04, mark * 0.15);
+              const ticks = healthy ? (paperCapitTicks.current.get(p.id) ?? 0) + 1 : (paperCapitTicks.current.get(p.id) ?? 0);
+              paperCapitTicks.current.set(p.id, ticks);
+              if (ticks < 3) continue;
+            } else {
+              paperCapitTicks.current.delete(p.id);
+            }
+          }
           slBreach.current.delete(p.id);
+          paperCapitTicks.current.delete(p.id);
           useAiDesk.getState().paperClose(p.id, exitPrice, proceeds, exitFee, reason);
           const pnl = proceeds - exitFee - p.costUsd - p.feeUsd;
           notify({
@@ -1928,6 +1951,8 @@ export function useAiDeskEngine() {
   const liveUnmanagedMiss = useRef(new Map<string, number>()); // posId → consecutive no-signer ticks
   const liveDustWarned = useRef(new Set<string>()); // one note per sub-$1 unsellable remainder
   const liveReconcileMiss = useRef(new Map<string, number>()); // posId → consecutive on-chain-shortfall ticks
+  const liveGapHeld = useRef(new Set<string>()); // one note per position held through a dislocated/gapped book
+  const liveCapitTicks = useRef(new Map<string, number>()); // posId → consecutive healthy-book ticks below the SL floor
   useEffect(() => {
     if (config.executionMode !== "LIVE" || !desk.liveExecuted.length) return;
     if (!phantomWalletClient && !sessReady) return; // no signer available at all
@@ -1959,6 +1984,20 @@ export function useAiDeskEngine() {
               });
               continue; // triggers evaluate from the next tick, on rebased values
             }
+            // DISLOCATED-BOOK GUARD: when the bid side gets pulled, the mid
+            // collapses artificially (bid 15¢ / ask 55¢ → mid 35¢) — that is
+            // a liquidity hole, not a repricing. Trusting it would both
+            // trigger phantom stop-losses AND sell into garbage bids. A
+            // dislocated book freezes this position for the tick: no breach
+            // counting, no exits, until two-sided quotes return.
+            const spread = stats.bestBid !== null && stats.bestAsk !== null ? stats.bestAsk - stats.bestBid : null;
+            if (spread !== null && spread > Math.max(0.1, mark * 0.4)) {
+              if (!liveGapHeld.current.has(p.decisionId)) {
+                liveGapHeld.current.add(p.decisionId);
+                notify({ kind: "SYSTEM", title: "BOOK DISLOCATED — POSITION FROZEN", body: `${p.question.slice(0, 56)} — bids pulled (spread ${(spread * 100).toFixed(0)}¢). No exit will fire into this; waiting for two-sided quotes.`, href: "/ai" });
+              }
+              continue;
+            }
             const hitTp = mark >= p.tpPrice;
             const hitTime = now >= p.deadline;
             let hitSl = false;
@@ -1969,7 +2008,11 @@ export function useAiDeskEngine() {
             } else {
               liveSlBreach.current.delete(p.decisionId);
             }
-            if (!hitTp && !hitSl && !hitTime) continue;
+            if (!hitTp && !hitSl && !hitTime) {
+              liveCapitTicks.current.delete(p.decisionId);
+              liveGapHeld.current.delete(p.decisionId);
+              continue;
+            }
             // verified-real TP: only close if selling into the ACTUAL bids
             // nets a profit; otherwise hold (SL/deadline still guard downside)
             if (hitTp && !hitSl && !hitTime) {
@@ -2111,6 +2154,34 @@ export function useAiDeskEngine() {
               continue;
             }
             liveDustWarned.current.delete(p.decisionId);
+            // STOP-LIMIT BAND: a stop-loss is a max-pain line, not a market
+            // dump. If the book only pays materially BELOW the stop (gapped
+            // through it — entry 79¢, stop 75¢, best fill 15¢), selling
+            // instantly donates the gap. Hold instead — UNLESS the market has
+            // GENUINELY repriced: a tight, two-sided book below the floor for
+            // 3 consecutive ticks (~15s) is a real move, and an orderly exit
+            // there salvages what's left rather than riding to zero. Pure-TP
+            // closes skip this (already net-positive-verified above).
+            if (!(hitTp && !hitSl && !hitTime)) {
+              const slFloor = Math.max(0.01, p.slPrice - Math.max(0.04, p.slPrice * 0.12));
+              if (sellPreview.avgPrice < slFloor) {
+                const healthy = spread !== null && spread <= Math.max(0.04, mark * 0.15);
+                const ticks = healthy ? (liveCapitTicks.current.get(p.decisionId) ?? 0) + 1 : (liveCapitTicks.current.get(p.decisionId) ?? 0);
+                liveCapitTicks.current.set(p.decisionId, ticks);
+                if (ticks < 3) {
+                  if (!liveGapHeld.current.has(p.decisionId)) {
+                    liveGapHeld.current.add(p.decisionId);
+                    notify({ kind: "SYSTEM", title: "STOP GAPPED — HOLDING, NOT DUMPING", body: `${p.question.slice(0, 56)} — book pays ~${(sellPreview.avgPrice * 100).toFixed(0)}¢ vs stop ${(p.slPrice * 100).toFixed(0)}¢. Holding; will exit only on a confirmed two-sided repricing.`, href: "/ai" });
+                    sendLiveMail({ kind: "FAULT", key: `slgap:${p.decisionId}`, title: "STOP GAPPED — HOLDING", detail: `${p.outcome.toUpperCase()} stop at ${(p.slPrice * 100).toFixed(0)}¢ but the book only pays ~${(sellPreview.avgPrice * 100).toFixed(0)}¢. Not dumping into the gap; exiting only if a tight two-sided book confirms the repricing (~15s), else the position holds.`, market: p.question, outcome: p.outcome, kpi: liveMailKpi() });
+                  }
+                  continue;
+                }
+                // 3 healthy ticks below the floor — genuine repricing;
+                // fall through to an orderly exit at the real book
+              } else {
+                liveCapitTicks.current.delete(p.decisionId);
+              }
+            }
             const bound = Math.max(tickSize, sellPreview.avgPrice * 0.985 - tickSize);
             const snapped = snapToTick(bound, tickSize);
             const res = await signAndPlaceOrder(wClient, wAddr, {
@@ -2144,6 +2215,8 @@ export function useAiDeskEngine() {
             const fullClose = filled >= p.shares - 0.01;
             if (fullClose) {
               liveSlBreach.current.delete(p.decisionId);
+              liveCapitTicks.current.delete(p.decisionId);
+              liveGapHeld.current.delete(p.decisionId);
               desk.recordLiveClose(p.decisionId, exitPx, proceeds, exitFeeQuote.feeUsd, reason);
             } else {
               // keep the SL breach streak: the remainder is still through its
