@@ -23,6 +23,7 @@ import {
   useAiDesk,
   paperEquity,
   deployCapFrac,
+  trailingStopPrice,
   effectiveDeskConfig,
   type DeskDecision,
   type RiskProfile,
@@ -1040,7 +1041,13 @@ function Desk() {
                             {(p.entryPrice * 100).toFixed(1)}¢ → {(mark * 100).toFixed(1)}¢
                           </td>
                           <td className="mono-num px-2 text-right text-[10px] text-faint">
-                            {(p.tpPrice * 100).toFixed(0)} / {(p.slPrice * 100).toFixed(0)}
+                            {(p.peakMark ?? p.entryPrice) >= p.tpPrice ? (
+                              <span className="text-pos2" title="Kâr aktif — koşuyor. Tavan yok; iz-süren stop kazancı korur.">
+                                ↗ {(trailingStopPrice(p.entryPrice, p.peakMark ?? p.entryPrice) * 100).toFixed(0)}
+                              </span>
+                            ) : (
+                              <>{(p.tpPrice * 100).toFixed(0)} / {(p.slPrice * 100).toFixed(0)}</>
+                            )}
                           </td>
                           <td className="mono-num px-2 text-right text-[11px] text-text">{fmt.usd(p.costUsd)}</td>
                           <td className={cx("mono-num px-2 text-right text-[11px]", pnl >= 0 ? "text-pos" : "text-neg")}>
@@ -1099,7 +1106,13 @@ function Desk() {
                             <LiveNum value={mark} format={(v) => `${(p.entryPrice * 100).toFixed(1)}¢ → ${(v * 100).toFixed(1)}¢`} />
                           </td>
                           <td className="mono-num px-2 text-right text-[10px] text-faint">
-                            {(p.tpPrice * 100).toFixed(0)} / {(p.slPrice * 100).toFixed(0)}
+                            {(p.peakMark ?? p.entryPrice) >= p.tpPrice ? (
+                              <span className="text-pos2" title="Kâr aktif — koşuyor. Tavan yok; iz-süren stop kazancı korur.">
+                                ↗ {(trailingStopPrice(p.entryPrice, p.peakMark ?? p.entryPrice) * 100).toFixed(0)}
+                              </span>
+                            ) : (
+                              <>{(p.tpPrice * 100).toFixed(0)} / {(p.slPrice * 100).toFixed(0)}</>
+                            )}
                           </td>
                           <td className="mono-num px-2 text-right text-[11px] text-text">{fmt.usd(p.costUsd)}</td>
                           <td className={cx("mono-num px-2 text-right text-[11px]", pnl >= 0 ? "text-pos" : "text-neg")}>
@@ -1152,6 +1165,7 @@ function Desk() {
                       >
                         {d.status === "PROPOSED" && paperMode && paper.active ? "QUEUED — AUTO-FILL" : d.status}
                       </Tag>
+                      {d.copy && <Tag tone="accent">COPY · {d.copy}</Tag>}
                       {d.aiVerdict === "GO" && <Tag tone="pos">AI GO</Tag>}
                       {d.aiVerdict === "VETO" && <Tag tone="neg">AI VETO</Tag>}
                       <span className="mono-num ml-auto text-[9px] text-faint">{fmt.timeAgo(d.ts)} AGO</span>

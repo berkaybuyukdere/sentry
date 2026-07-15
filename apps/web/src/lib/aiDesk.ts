@@ -112,6 +112,10 @@ export interface DeskDecision {
   tpFrac: number; // take-profit distance as fraction of entry (cost-clearing)
   slFrac: number; // stop-loss distance as fraction of entry
   eligible: boolean; // EV>0 AND backed by a real signal (momentum/signal/live spot)
+  /** set when this entry copies a tracked elite operator's fresh BUY —
+   *  "name (winRate%)". Copy trades bypass the selectivity floor and rank
+   *  first, but still respect the EV>0 gate (never copy into a bad spread). */
+  copy: string | null;
   reasons: string[];
   aiVerdict: "GO" | "VETO" | null;
   aiNote: string | null;
@@ -133,6 +137,10 @@ export interface PaperPosition {
   tpPrice: number;
   slPrice: number;
   deadline: number;
+  /** highest mark seen — drives the trailing stop once the position clears
+   *  the profit-activation level (tpPrice). Winners are not capped; they run
+   *  until the trail is hit or the market resolves. */
+  peakMark?: number;
 }
 
 export interface ClosedTrade {
@@ -220,6 +228,10 @@ export interface LiveExecution {
    *  identity (its proxy holds the shares). Absent on pre-autopilot records,
    *  which all belonged to the main Phantom account. */
   owner?: string;
+  /** highest mark seen — drives the trailing stop once the position clears
+   *  tpPrice. Winners run uncapped until the trail is hit or the market
+   *  resolves; the trail ratchets up and never lets a winner become a loss. */
+  peakMark?: number;
 }
 
 export interface LiveClosedTrade {
@@ -291,6 +303,9 @@ interface DeskState {
   startPaperSession: () => void;
   stopPaperSession: () => void;
   paperOpen: (p: PaperPosition) => void;
+  /** persist the running peak on a paper position (trailing-stop anchor) —
+   *  survives reload so a winner never silently de-activates */
+  setPaperPeak: (positionId: string, peak: number) => void;
   paperClose: (positionId: string, exitPrice: number, proceeds: number, exitFee: number, reason: ClosedTrade["reason"]) => void;
   setAiStatus: (s: string | null) => void;
   setLiveAutoStatus: (s: string | null) => void;
@@ -586,6 +601,14 @@ export const useAiDesk = create<DeskState>()(
           decisions: s.decisions.map((d) => (d.id === p.decisionId ? { ...d, status: "FILLED" } : d)),
         })),
 
+      setPaperPeak: (positionId, peak) =>
+        set((s) => ({
+          paper: {
+            ...s.paper,
+            positions: s.paper.positions.map((p) => (p.id === positionId ? { ...p, peakMark: peak } : p)),
+          },
+        })),
+
       paperClose: (positionId, exitPrice, proceeds, exitFee, reason) =>
         set((s) => {
           const pos = s.paper.positions.find((p) => p.id === positionId);
@@ -695,6 +718,25 @@ export function deployCapFrac(realizedPnl: number, capital: number): number {
   if (capital <= 0) return 0.12;
   const r = realizedPnl / capital;
   return Math.max(0.25, Math.min(0.7, 0.55 + r * 4));
+}
+
+/**
+ * Trailing-stop price for a position that has cleared its profit-activation
+ * level. Winners are NOT capped by a fixed take-profit — instead the stop
+ * ratchets up under the running peak, giving back at most HALF the peak gain
+ * (capped at 8% of price so a near-resolution position has room to breathe),
+ * and floored just above breakeven so an activated winner can never turn into
+ * a loss. As the peak rises the stop rises with it and never falls back; a
+ * genuine runner rides all the way toward $1 resolution.
+ *
+ *   entry 0.52, peak 0.56 → giveback min(0.02, 0.045)=0.02 → stop 0.54  (+3.8%)
+ *   entry 0.52, peak 0.80 → giveback min(0.14, 0.064)=0.064 → stop 0.736 (+41%)
+ *   entry 0.52, peak 0.95 → giveback min(0.215, 0.076)=0.076 → stop 0.874 (+68%)
+ */
+export function trailingStopPrice(entryPrice: number, peakMark: number): number {
+  const gain = Math.max(0, peakMark - entryPrice);
+  const giveback = Math.min(0.5 * gain, 0.08 * peakMark);
+  return Math.max(entryPrice * 1.002, peakMark - giveback);
 }
 
 export function paperEquity(paper: PaperSession, markOf: (tokenId: string, fallback: number) => number): number {
@@ -914,7 +956,14 @@ export function sweepUniverse(
   rows.forEach((r, i) => {
     const alpha = alphas[i];
     const confidence = Math.round(pctl(alpha) * 10) / 10;
-    if (confidence < cfg.minConfidence) return;
+    // --- COPY TRADE: a fresh BUY from a tracked elite operator --------------
+    //  Looked up BEFORE the selectivity floor so a copy is never filtered out
+    //  by relative alpha ranking — a top wallet's live conviction is a real,
+    //  external signal, not something to rank against the noise around it.
+    const smart = smartBuys[`${r.m.conditionId}:${(r.m.outcomes[r.outcomeIndex] ?? "").toLowerCase()}`];
+    // selectivity floor gates statistical candidates; copies bypass it (the
+    // EV>0 gate still applies below, so we never copy into a bad spread)
+    if (!smart && confidence < cfg.minConfidence) return;
 
     // --- live spot + futures alignment for crypto/gold-linked markets -------
     //  never fade the real tape: counter-trend positions are vetoed, aligned
@@ -923,10 +972,12 @@ export function sweepUniverse(
     //  (a flat veto was silently killing every BTC up/down entry).
     const spot = cryptoAlignment(r.m.question, r.m.outcomes[r.outcomeIndex] ?? "", cryptoRows);
     if (spot && spot.dir === "against") return;
-    // --- elite operator flow: a fresh BUY from a ≥90%-win wallet ------------
-    const smart = smartBuys[`${r.m.conditionId}:${(r.m.outcomes[r.outcomeIndex] ?? "").toLowerCase()}`];
+    // copy weight scales with the operator's MEASURED realized win rate: a
+    // 70% wallet adds ~1.0σ, an 87% wallet ~1.85σ, a 90%+ wallet ~2.0σ — so
+    // copies rank at/near the top of the fill batch, entered first each cycle.
     const spotBoost = spot?.dir === "with" ? 0.9 + (spot.fundingAgree ? 0.4 : 0) : 0;
-    const alphaAdj = alpha + spotBoost + (smart ? 1.2 : 0);
+    const copyBoost = smart ? Math.min(2.2, 1.0 + Math.max(0, smart.winRate - 0.7) * 5) : 0;
+    const alphaAdj = alpha + spotBoost + copyBoost;
 
     // --- market friction (price units per share) ----------------------------
     //  entry crosses the book (taker); winners exit on a resting limit (no
@@ -979,7 +1030,7 @@ export function sweepUniverse(
     if (Math.abs(r.flowAligned) > 0.25) reasons.push(`tape flow ${(r.flowAligned * 100).toFixed(0)}% aligned (30m order-flow imbalance)`);
     if (zTurn[i] > 0.8) reasons.push(`turnover z ${zTurn[i].toFixed(1)} — ${r.turnover.toFixed(1)}× book/24h`);
     if (spot?.dir === "with") reasons.push(`LIVE SPOT ${spot.sym} 15m ${(spot.ret15m * 100).toFixed(2)}% — aligned with position${spot.fundingAgree ? " · PERP FUNDING AGREES (futures tape)" : ""}`);
-    if (smart) reasons.push(`ELITE FLOW — ${smart.name} (${Math.round(smart.winRate * 100)}% WIN, settled) bought ${smart.outcome} @ ${(smart.price * 100).toFixed(0)}¢`);
+    if (smart) reasons.push(`COPY — ${smart.name} (${Math.round(smart.winRate * 100)}% WIN, settled) bought ${smart.outcome} @ ${(smart.price * 100).toFixed(0)}¢`);
     if (netEv > 0 && !hasRealSignal) reasons.push(`passed — positive EV but no confirming signal (momentum/flow/spot); not eligible`);
 
     decisions.push({
@@ -1005,6 +1056,7 @@ export function sweepUniverse(
       tpFrac,
       slFrac,
       eligible: isEligible,
+      copy: smart ? `${smart.name} (${Math.round(smart.winRate * 100)}%)` : null,
       reasons,
       aiVerdict: null,
       aiNote: null,
@@ -1161,6 +1213,7 @@ export function useAiDeskEngine() {
   const opening = useRef(false);
   const closing = useRef(false);
   const slBreach = useRef(new Map<string, number>()); // posId → consecutive SL ticks
+  const paperTrailBreach = useRef(new Map<string, number>()); // posId → consecutive trailing-stop breach ticks
   const paperCapitTicks = useRef(new Map<string, number>()); // posId → healthy-book ticks below the SL floor
   const startLiveRef = useLiveRef((s) => s.start);
   const cryptoRows = useLiveRef((s) => s.rows);
@@ -1373,7 +1426,8 @@ export function useAiDeskEngine() {
     const perCycle = realized < -0.02 * paper.startingCapital ? Math.max(1, Math.floor(tempo.entriesPerCycle / 2)) : tempo.entriesPerCycle;
     const batch = decisions
       .filter((d) => d.status === "PROPOSED" && d.eligible && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
-      .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)
+      // copies first (a tracked elite operator's live conviction), then EV/hr
+      .sort((x, y) => (x.copy ? 0 : 1) - (y.copy ? 0 : 1) || y.evPerHourUsd - x.evPerHourUsd)
       .slice(0, Math.min(perCycle, slots));
     if (!batch.length) return;
 
@@ -1483,10 +1537,17 @@ export function useAiDeskEngine() {
           // stays an honest predictor of live behavior
           const pSpread = stats && stats.bestBid !== null && stats.bestAsk !== null ? stats.bestAsk - stats.bestBid : null;
           if (pSpread !== null && pSpread > Math.max(0.1, mark * 0.4)) continue;
-          const hitTp = mark >= p.tpPrice;
-          const hitTime = now >= p.deadline;
-          // stop-loss needs TWO consecutive breaching ticks (~8s) of the real
-          // book mid — a single wobble or shallow red never insta-cancels
+          // LET WINNERS RUN (mirrors LIVE): the take-profit is now only an
+          // activation level; past it, a ratcheting trailing stop protects the
+          // gain and the winner runs uncapped, with no time deadline. Peak is
+          // PERSISTED on the position (survives reload) so a running winner
+          // never silently de-activates.
+          const ppeak = Math.max(p.peakMark ?? p.entryPrice, mark);
+          if (ppeak > (p.peakMark ?? p.entryPrice) + 1e-6) useAiDesk.getState().setPaperPeak(p.id, ppeak);
+          const pActivated = ppeak >= p.tpPrice;
+          const hitTime = !pActivated && now >= p.deadline;
+          // HARD STOP FLOOR — always armed, even after activation (a reversed
+          // winner is still a stop-loss; the stop-limit band below is gap-safe)
           let hitSl = false;
           if (mark <= p.slPrice) {
             const n = (slBreach.current.get(p.id) ?? 0) + 1;
@@ -1494,6 +1555,20 @@ export function useAiDeskEngine() {
             hitSl = n >= 2;
           } else {
             slBreach.current.delete(p.id);
+          }
+          // TRAILING PROFIT LOCK — a separate layer above the stop floor
+          let hitTp = false;
+          if (pActivated && !hitSl) {
+            const trail = trailingStopPrice(p.entryPrice, ppeak);
+            if (mark <= trail) {
+              const n = (paperTrailBreach.current.get(p.id) ?? 0) + 1;
+              paperTrailBreach.current.set(p.id, n);
+              hitTp = n >= 2;
+            } else {
+              paperTrailBreach.current.delete(p.id);
+            }
+          } else {
+            paperTrailBreach.current.delete(p.id);
           }
           if (!hitTp && !hitSl && !hitTime) {
             paperCapitTicks.current.delete(p.id);
@@ -1524,6 +1599,7 @@ export function useAiDeskEngine() {
           }
           slBreach.current.delete(p.id);
           paperCapitTicks.current.delete(p.id);
+          paperTrailBreach.current.delete(p.id);
           useAiDesk.getState().paperClose(p.id, exitPrice, proceeds, exitFee, reason);
           const pnl = proceeds - exitFee - p.costUsd - p.feeUsd;
           notify({
@@ -1743,7 +1819,8 @@ export function useAiDeskEngine() {
     const batch = candidates
       .filter((d) => d.eligible && d.evCents > 0 && d.aiVerdict !== "VETO" && (!config.claudeEnabled || d.aiVerdict === "GO"))
       .filter((d) => !openSlugs.has(d.slug)) // never double-enter the same market
-      .sort((x, y) => y.evPerHourUsd - x.evPerHourUsd)
+      // copies first (a tracked elite operator's live conviction), then EV/hr
+      .sort((x, y) => (x.copy ? 0 : 1) - (y.copy ? 0 : 1) || y.evPerHourUsd - x.evPerHourUsd)
       .slice(0, Math.min(perCycle, slots));
     if (!batch.length) {
       status(
@@ -1990,6 +2067,7 @@ export function useAiDeskEngine() {
   const liveUnmanagedWarned = useRef(new Set<string>()); // one warning per stuck position
   const liveUnmanagedMiss = useRef(new Map<string, number>()); // posId → consecutive no-signer ticks
   const liveDustWarned = useRef(new Set<string>()); // one note per sub-$1 unsellable remainder
+  const liveTrailBreach = useRef(new Map<string, number>()); // posId → consecutive trailing-stop breach ticks
   const liveReconcileMiss = useRef(new Map<string, number>()); // posId → consecutive on-chain-shortfall ticks
   const liveGapHeld = useRef(new Set<string>()); // one note per position held through a dislocated/gapped book
   const liveCapitTicks = useRef(new Map<string, number>()); // posId → consecutive healthy-book ticks below the SL floor
@@ -2039,8 +2117,25 @@ export function useAiDeskEngine() {
               }
               continue;
             }
-            const hitTp = mark >= p.tpPrice;
-            const hitTime = now >= p.deadline;
+            // LET WINNERS RUN: the old fixed take-profit is now only an
+            // ACTIVATION level. Once the peak clears it, the position is no
+            // longer capped — a ratcheting trailing stop (trailingStopPrice)
+            // protects the gain while the winner rides toward resolution. A
+            // fixed stop-loss guards the downside until activation; after
+            // activation the trailing stop sits above breakeven so a winner
+            // can never become a loss, and the time deadline no longer applies
+            // (a running winner is never time-stopped).
+            const peak = Math.max(p.peakMark ?? p.entryPrice, mark);
+            if (peak > (p.peakMark ?? p.entryPrice) + 1e-6) {
+              desk.rebaseLivePosition(p.decisionId, { peakMark: peak });
+            }
+            const activated = peak >= p.tpPrice;
+            const hitTime = !activated && now >= p.deadline;
+            // HARD STOP FLOOR — always armed, even after activation. A winner
+            // that reverses all the way through its fixed stop is still a
+            // stop-loss; the stop-limit band + capitulation below govern the
+            // actual sell (gap-safe). Without this, an activated position that
+            // collapsed had NO loss-side exit and rode to zero.
             let hitSl = false;
             if (mark <= p.slPrice) {
               const n = (liveSlBreach.current.get(p.decisionId) ?? 0) + 1;
@@ -2049,13 +2144,33 @@ export function useAiDeskEngine() {
             } else {
               liveSlBreach.current.delete(p.decisionId);
             }
+            // TRAILING PROFIT LOCK — a separate layer sitting ABOVE the stop
+            // floor, active only once the position has run past activation.
+            // Locks a gain when it pulls back to the trail; the net-positive
+            // check below holds it if a gap would make the sell a loss (the
+            // hard SL then catches a deeper collapse).
+            let hitTp = false;
+            if (activated && !hitSl) {
+              const trail = trailingStopPrice(p.entryPrice, peak);
+              if (mark <= trail) {
+                const n = (liveTrailBreach.current.get(p.decisionId) ?? 0) + 1;
+                liveTrailBreach.current.set(p.decisionId, n);
+                hitTp = n >= 2;
+              } else {
+                liveTrailBreach.current.delete(p.decisionId);
+              }
+            } else {
+              liveTrailBreach.current.delete(p.decisionId);
+            }
             if (!hitTp && !hitSl && !hitTime) {
               liveCapitTicks.current.delete(p.decisionId);
               liveGapHeld.current.delete(p.decisionId);
               continue;
             }
-            // verified-real TP: only close if selling into the ACTUAL bids
-            // nets a profit; otherwise hold (SL/deadline still guard downside)
+            // verified-real profit exit: only lock the trailing stop if selling
+            // into the ACTUAL bids nets a profit; a gap below the trail HOLDS
+            // (the position recovers, or a real collapse trips the fixed SL /
+            // stop-limit band on a later tick)
             if (hitTp && !hitSl && !hitTime) {
               const preview = estimateSell(stats.bids, p.shares);
               const previewProceeds = preview.filledShares > 0 ? preview.proceedsUsd : mark * p.shares;
@@ -2313,6 +2428,7 @@ export function useAiDeskEngine() {
             const fullClose = filled >= p.shares - 0.01;
             if (fullClose) {
               liveSlBreach.current.delete(p.decisionId);
+              liveTrailBreach.current.delete(p.decisionId);
               liveCapitTicks.current.delete(p.decisionId);
               liveGapHeld.current.delete(p.decisionId);
               desk.recordLiveClose(p.decisionId, exitPx, proceeds, exitFeeQuote.feeUsd, reason);
