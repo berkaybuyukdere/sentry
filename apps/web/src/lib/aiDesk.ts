@@ -5,6 +5,7 @@ import { persist } from "zustand/middleware";
 import Anthropic from "@anthropic-ai/sdk";
 import {
   fetchOrderBook,
+  fetchMarketBySlug,
   bookStats,
   estimateFill,
   estimateSell,
@@ -234,10 +235,13 @@ export interface LiveClosedTrade {
   feeUsd: number;
   exitFee: number;
   pnl: number;
-  reason: "TAKE_PROFIT" | "STOP_LOSS" | "TIME_EXIT" | "MANUAL";
+  reason: "TAKE_PROFIT" | "STOP_LOSS" | "TIME_EXIT" | "MANUAL" | "RESOLVED";
   closedTs: number;
   /** lowercase EOA that owned the position — realized P&L is per-identity */
   owner?: string;
+  /** RESOLVED trades settle on-chain: the operator collects by redeeming on
+   *  Polymarket (or the payout auto-credits). Flagged so the UI can prompt. */
+  awaitingRedeem?: boolean;
 }
 
 interface DeskState {
@@ -281,6 +285,9 @@ interface DeskState {
   /** drops a position with zero real on-chain balance — no proceeds are
    *  known, so it is removed WITHOUT a liveClosed entry (never fabricate P&L) */
   writeOffLivePosition: (decisionId: string) => void;
+  /** market resolved on-chain — books the settled payout ($1/share if the
+   *  held outcome won, else $0) and flags a winner as awaiting redemption */
+  recordLiveResolution: (decisionId: string, won: boolean) => void;
   startPaperSession: () => void;
   stopPaperSession: () => void;
   paperOpen: (p: PaperPosition) => void;
@@ -449,6 +456,39 @@ export const useAiDesk = create<DeskState>()(
         set((s) => ({
           liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
         })),
+
+      recordLiveResolution: (decisionId, won) =>
+        set((s) => {
+          const pos = s.liveExecuted.find((e) => e.decisionId === decisionId);
+          if (!pos) return s;
+          // resolved value is settled truth: winner redeems each share for $1,
+          // loser for $0. No exit fee — redemption is not a CLOB trade. The
+          // operator collects the payout by redeeming on Polymarket (or it
+          // auto-credits), so the P&L is real but the cash lands on redeem.
+          const proceeds = won ? pos.shares : 0;
+          const trade: LiveClosedTrade = {
+            decisionId,
+            ts: pos.ts,
+            slug: pos.slug,
+            question: pos.question,
+            outcome: pos.outcome,
+            entryPrice: pos.entryPrice,
+            exitPrice: won ? 1 : 0,
+            shares: pos.shares,
+            costUsd: pos.costUsd,
+            feeUsd: pos.feeUsd,
+            exitFee: 0,
+            pnl: proceeds - pos.costUsd - pos.feeUsd,
+            reason: "RESOLVED",
+            closedTs: Math.floor(Date.now() / 1000),
+            owner: pos.owner,
+            awaitingRedeem: won, // losers need no action
+          };
+          return {
+            liveExecuted: s.liveExecuted.filter((e) => e.decisionId !== decisionId),
+            liveClosed: [trade, ...s.liveClosed].slice(0, 100),
+          };
+        }),
 
       recordLiveClose: (decisionId, exitPrice, proceeds, exitFee, reason) =>
         set((s) => {
@@ -1953,6 +1993,7 @@ export function useAiDeskEngine() {
   const liveReconcileMiss = useRef(new Map<string, number>()); // posId → consecutive on-chain-shortfall ticks
   const liveGapHeld = useRef(new Set<string>()); // one note per position held through a dislocated/gapped book
   const liveCapitTicks = useRef(new Map<string, number>()); // posId → consecutive healthy-book ticks below the SL floor
+  const liveResolveCheck = useRef(new Map<string, number>()); // posId → last resolution-check unix sec (throttle gamma)
   useEffect(() => {
     if (config.executionMode !== "LIVE" || !desk.liveExecuted.length) return;
     if (!phantomWalletClient && !sessReady) return; // no signer available at all
@@ -2132,6 +2173,63 @@ export function useAiDeskEngine() {
             const mkt = universe?.find((m) => m.slug === p.slug);
             const tickSize = mkt?.tickSize ?? p.tickSize;
             const negRisk = mkt?.negRisk ?? p.negRisk;
+            // RESOLUTION CHECK: a market with no bids (or a sub-$1 dust
+            // remainder) may have RESOLVED — shares are then worth $1 (win) or
+            // $0 (loss), collected by redeeming on Polymarket, and there is
+            // nothing to sell. Detecting it books the settled P&L (the +$5.04
+            // the operator redeemed manually was invisible to the ledger) and
+            // stops the position hanging in OPEN forever. Throttled to one
+            // gamma lookup / 45s per position (only illiquid positions reach
+            // here, and resolution is a one-way state).
+            const illiquid = stats.bestBid === null;
+            const dust = !illiquid && (() => {
+              const bf = Math.max(tickSize, (stats.bestBid ?? 0) * 0.9);
+              const pv = estimateSell(stats.bids.filter((b) => b.price >= bf), p.shares);
+              return Math.floor(pv.filledShares * 100) / 100 * pv.avgPrice < 1.02;
+            })();
+            if (illiquid || dust) {
+              const last = liveResolveCheck.current.get(p.decisionId) ?? 0;
+              if (now - last >= 45) {
+                liveResolveCheck.current.set(p.decisionId, now);
+                // always re-fetch (a cached universe row can still show the
+                // market open); gamma is the ground truth for resolution
+                const live = await fetchMarketBySlug(p.slug).catch(() => null);
+                const oi = live ? live.outcomes.findIndex((o) => o.toLowerCase() === p.outcome.toLowerCase()) : -1;
+                const resolvedPx = live && oi >= 0 ? (live.outcomePrices[oi] ?? 0.5) : 0.5;
+                // require a DECISIVE settlement: closed AND the outcome priced
+                // to ~1 or ~0. A closed-but-still-ambiguous market (prices near
+                // 0.5) re-checks next cycle rather than mis-booking a coin flip.
+                if (live?.closed && (resolvedPx >= 0.95 || resolvedPx <= 0.05)) {
+                  const won = resolvedPx >= 0.95;
+                  const pnl = (won ? p.shares : 0) - p.costUsd - p.feeUsd;
+                  desk.recordLiveResolution(p.decisionId, won);
+                  liveResolveCheck.current.delete(p.decisionId);
+                  notify({
+                    kind: "ORDER",
+                    title: won ? "AI DESK — MARKET RESOLVED (WON)" : "AI DESK — MARKET RESOLVED (LOST)",
+                    body: won
+                      ? `${p.question.slice(0, 52)} — ${p.outcome.toUpperCase()} won. ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)} net. Redeem on Polymarket to collect.`
+                      : `${p.question.slice(0, 52)} — ${p.outcome.toUpperCase()} lost. $${pnl.toFixed(2)}.`,
+                    href: "/ai",
+                  });
+                  sendLiveMail({
+                    kind: won ? "CLOSE" : "FAULT",
+                    key: `resolved:${p.decisionId}`,
+                    title: won ? `RESOLVED WON — +$${pnl.toFixed(2)} NET (REDEEM TO COLLECT)` : `RESOLVED LOST — $${pnl.toFixed(2)}`,
+                    detail: `${p.outcome.toUpperCase()} on "${p.question.slice(0, 60)}" settled ${won ? "IN YOUR FAVOR — each share redeems for $1" : "against you — shares are worth $0"}. ${won ? "Collect by redeeming on Polymarket (or it auto-credits)." : "No action needed."}`,
+                    market: p.question,
+                    outcome: p.outcome,
+                    entryPrice: p.entryPrice,
+                    exitPrice: won ? 1 : 0,
+                    sizeUsd: p.costUsd,
+                    pnlUsd: pnl,
+                    reason: "RESOLVED",
+                    kpi: liveMailKpi(),
+                  });
+                  continue;
+                }
+              }
+            }
             // FAK sells must be priced off the ACTUAL bids, not the mid: on a
             // thin/wide book the mid sits far above the best bid, the bound
             // never matches, and the order dies "no orders found to match"

@@ -1253,9 +1253,20 @@ function Desk() {
                   <Link key={t.decisionId + t.closedTs} to={`/market/${t.slug}`} className="hairline-b row-hover block px-3 py-2.5">
                     <div className="line-clamp-1 text-[11px] text-text">{t.question}</div>
                     <div className="mono-num mt-1 flex items-center gap-2.5 text-[10px]">
-                      <Tag tone={t.reason === "TAKE_PROFIT" ? "pos" : t.reason === "STOP_LOSS" ? "neg" : "dim"}>
+                      <Tag tone={t.reason === "TAKE_PROFIT" || (t.reason === "RESOLVED" && t.pnl >= 0) ? "pos" : t.reason === "STOP_LOSS" || (t.reason === "RESOLVED" && t.pnl < 0) ? "neg" : "dim"}>
                         {t.reason.replaceAll("_", " ")}
                       </Tag>
+                      {t.awaitingRedeem && (
+                        <a
+                          href="https://polymarket.com/portfolio"
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(e) => e.stopPropagation()}
+                          className="border border-accent/50 bg-accent/10 px-1 text-[9px] font-semibold uppercase tracking-[0.08em] text-accent2 hover:bg-accent/20"
+                        >
+                          REDEEM ↗
+                        </a>
+                      )}
                       <span className="text-faint">
                         {(t.entryPrice * 100).toFixed(1)}¢ → {(t.exitPrice * 100).toFixed(1)}¢
                       </span>
