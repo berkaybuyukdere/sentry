@@ -1736,6 +1736,11 @@ export function useAiDeskEngine() {
               lastSkipReason = `${next.question.slice(0, 40)} — clip rounds to under 0.01 shares`;
               continue;
             }
+            // small clips fill all-or-nothing (FOK): a partial fill on a $2-4
+            // clip can land under the CLOB's $1 minimum — an instant dust
+            // position no order can ever exit (rides to resolution). Larger
+            // clips keep FAK; a big partial is still a viable position.
+            const entryType = spend <= 10 ? "FOK" : "FAK";
             const res = await signAndPlaceOrder(wClient, wAddr, {
               tokenId: next.tokenId,
               side: "BUY",
@@ -1743,7 +1748,7 @@ export function useAiDeskEngine() {
               shares,
               tickSize: tick,
               negRisk: market.negRisk,
-              orderType: "FAK",
+              orderType: entryType,
             });
             if (!res.success) {
               // a config-fault (auth/maker/version) can't be fixed by retrying —
@@ -1804,7 +1809,7 @@ export function useAiDeskEngine() {
               price: entryPx,
               shares: filled,
               usd: costUsd,
-              orderType: "FAK",
+              orderType: entryType,
               clobOrderId: res.orderID ?? null,
               txHash: res.transactionsHashes?.[0] ?? null,
               status: res.status ?? "matched",

@@ -451,9 +451,7 @@ function Desk() {
               ))}
             </div>
             <p className="mt-1 text-[9px] leading-relaxed text-faint">
-              {paperMode
-                ? "FULLY AUTONOMOUS SIMULATION — FILLS COMPUTED AGAINST THE REAL ORDER BOOK, TIER FEES DEDUCTED, ZERO FUNDS AT RISK."
-                : "REAL EXECUTION — IDENTICAL ENGINE; YOUR WALLET SIGNS EVERY ORDER."}
+              {paperMode ? "SIMULATION VS THE REAL BOOK — ZERO FUNDS AT RISK." : "REAL EXECUTION — SAME ENGINE, REAL MONEY."}
             </p>
           </Field>
 
@@ -523,8 +521,7 @@ function Desk() {
                       </span>
                     </div>
                     <p className="mt-1 text-[9px] leading-relaxed text-faint">
-                      YOUR REAL POLYMARKET PROXY WALLET — CONFIRMED ON-CHAIN TO MATCH THE SITE'S CASH
-                      BALANCE. DEPOSITS/CONVERSIONS DONE ON POLYMARKET.COM LAND HERE.
+                      YOUR POLYMARKET PROXY — DEPOSITS ON POLYMARKET.COM LAND HERE.
                     </p>
                     {legacyBal > 0.5 && depositWallet?.toLowerCase() !== LEGACY_DEPOSIT_WALLET.toLowerCase() && (
                       <div className="mt-1.5 border border-warn/40 bg-warn/5 px-2 py-1.5">
@@ -627,8 +624,8 @@ function Desk() {
                 )}
                 <p className="mt-1 text-[9px] leading-relaxed text-faint">
                   {config.budgetAuto
-                    ? `BANKROLL TRACKS THE FULL WALLET (${tradingBal !== null ? fmt.usd(tradingBal, { compact: false }) : "—"}) — AS PROFITS LAND, CLIP SIZES AND DEPLOYMENT GROW WITH THE BANK AUTOMATICALLY.`
-                    : "BANKROLL = MIN(WALLET, BUDGET) — THE DESK NEVER DEPLOYS PAST THE CAP EVEN AS THE WALLET GROWS."}
+                    ? `TRACKS THE FULL WALLET (${tradingBal !== null ? fmt.usd(tradingBal, { compact: false }) : "—"}) — SIZING COMPOUNDS WITH PROFITS.`
+                    : "BANKROLL = MIN(WALLET, BUDGET) — HARD CAP."}
                 </p>
               </div>
               <Link
@@ -657,12 +654,12 @@ function Desk() {
                 </button>
               ))}
             </div>
-            <p className="mt-1 text-[9px] leading-relaxed text-faint">
+            <p className="mono-num mt-1 text-[9px] leading-relaxed text-faint">
               {config.tempo === "SCALP"
-                ? "CHURN — ≤3D MARKETS, 4% TAKE-PROFIT / 5% STOP, ≤15M HOLD, 8 ENTRIES/CYCLE, 6S SWEEP, UP TO 30 CONCURRENT."
+                ? "TP 4% · SL 5% · ≤15M HOLD · 6S SWEEP"
                 : config.tempo === "INTRADAY"
-                  ? "≤10D MARKETS, 12% TP, ≤4H HOLD, 3 ENTRIES/CYCLE, 20S SWEEP, UP TO 10 CONCURRENT."
-                  : "≤45D MARKETS, 20% TP, ≤24H HOLD, 2 ENTRIES/CYCLE, 45S SWEEP, UP TO 6 CONCURRENT."}
+                  ? "TP 12% · SL 8% · ≤4H HOLD · 20S SWEEP"
+                  : "TP 20% · SL 12% · ≤24H HOLD · 45S SWEEP"}
             </p>
           </Field>
 
@@ -746,8 +743,8 @@ function Desk() {
             </div>
             <p className="mt-1 text-[9px] leading-relaxed text-faint">
               {config.freeWill
-                ? "YOU SET CAPITAL AND TARGET — THE DESK DERIVES SIZING, EXPOSURE AND EXITS FROM THE LIVE BANKROLL AND CLIPS EVERY ORDER TO ORDER-BOOK DEPTH."
-                : "ALL SIZING AND RISK PARAMETERS UNDER MANUAL CONTROL."}
+                ? "SET CAPITAL + TARGET — THE DESK DERIVES THE REST."
+                : "ALL SIZING AND RISK UNDER MANUAL CONTROL."}
             </p>
           </Field>
 
@@ -883,10 +880,7 @@ function Desk() {
           </Field>
 
           <div className="hairline-t pt-2">
-            <span className="label-faint">
-              EXECUTIONS BILL AT THE SIGNAL RATE — {bpsPct(signalRate)} (SIMULATED IN PAPER) ·
-              LIVE MODE IS NON-CUSTODIAL: EVERY ORDER IS WALLET-SIGNED
-            </span>
+            <span className="label-faint">SIGNAL RATE {bpsPct(signalRate)} · NON-CUSTODIAL</span>
           </div>
         </div>
       </div>
@@ -1191,8 +1185,8 @@ function Desk() {
                       </span>
                       <span className="text-faint">α {d.alpha.toFixed(2)}σ</span>
                     </div>
-                    <ul className="mt-1.5 flex flex-col gap-0.5">
-                      {d.reasons.slice(0, 4).map((r) => (
+                    <ul className="mt-1.5 flex flex-col gap-0.5" title={d.reasons.join("\n")}>
+                      {d.reasons.slice(0, 2).map((r) => (
                         <li key={r} className="text-[10px] leading-snug text-dim">— {r}</li>
                       ))}
                       {d.aiNote && (
@@ -1334,14 +1328,10 @@ function AutopilotSignerPanel() {
       {!sess.pk ? (
         <>
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
-            LIVE ORDERS ARE EIP-712 SIGNATURES — WHILE THE KEY LIVES IN PHANTOM, PHANTOM PROMPTS
-            EVERY TIME. PASTE THE KEY ONCE AND THE DESK SIGNS EVERYTHING SILENTLY, PAPER-SPEED.
-            HOT KEY, THIS BROWSER ONLY — KEEP JUST THE TRADING BANKROLL ON IT.
+            PASTE YOUR KEY ONCE — THE DESK SIGNS EVERY ORDER SILENTLY. HOT KEY, THIS BROWSER ONLY.
           </p>
           <p className="mt-1 text-[9px] leading-relaxed text-accent2">
-            ONE STEP — PHANTOM → SETTINGS → MANAGE ACCOUNTS → YOUR ACCOUNT → SHOW PRIVATE KEY
-            (ETHEREUM) → PASTE BELOW → IMPORT. SAME ACCOUNT, SAME MONEY: THE TRADING WALLET
-            AUTO-LINKS, AUTOPILOT SELF-ARMS, AND CURRENT OPEN POSITIONS GO SILENT TOO.
+            PHANTOM → SETTINGS → MANAGE ACCOUNTS → SHOW PRIVATE KEY (ETHEREUM) → PASTE → IMPORT.
           </p>
           <div className="mt-1.5 flex gap-1">
             <input
@@ -1376,8 +1366,7 @@ function AutopilotSignerPanel() {
             </Btn>
           </div>
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
-            SAFER ALTERNATIVE — A DEDICATED BURNER (MAIN KEY NEVER LEAVES PHANTOM, BUT NEEDS A
-            ONE-TIME POLYMARKET DEPOSIT + PROXY LINK):
+            SAFER ALTERNATIVE — DEDICATED BURNER (NEEDS ITS OWN POLYMARKET DEPOSIT):
           </p>
           <button
             onClick={() => {
@@ -1405,10 +1394,8 @@ function AutopilotSignerPanel() {
           {!sess.proxyWallet ? (
             <>
               <p className="mt-1.5 text-[9px] leading-relaxed text-warn2">
-                ONE-TIME SETUP: 1) REVEAL KEY → IMPORT INTO PHANTOM. 2) LOG IN AT POLYMARKET.COM
-                WITH THAT ACCOUNT + DEPOSIT (DEPLOYS ITS PROXY WALLET, CONVERTS TO pUSD). 3) PROFILE
-                → "COPY ADDRESS" → PASTE BELOW. 4) ARM. FUND IT FROM THE MAIN WALLET — ONLY THE
-                BANKROLL, IT IS A HOT KEY.
+                1) IMPORT KEY INTO PHANTOM · 2) DEPOSIT ON POLYMARKET.COM AS THAT ACCOUNT ·
+                3) PASTE ITS PROFILE "COPY ADDRESS" BELOW · 4) ARM.
               </p>
               <div className="mt-1.5 flex gap-1">
                 <input
@@ -1477,14 +1464,13 @@ function AutopilotSignerPanel() {
           )}
           <p className="mt-1.5 text-[9px] leading-relaxed text-faint">
             {armed
-              ? "ARMED — THE DESK FILLS MULTIPLE ENTRIES PER SWEEP AND MANAGES EXITS AT PAPER SPEED, ALL SIGNED SILENTLY. NO PROMPTS. SET STAGING TO ARM + ENGAGE THE DESK."
-              : "DISARMED — NEW ORDERS FALL BACK TO PHANTOM (ONE PROMPT PER ORDER, ONE AT A TIME). SESSION-OWNED POSITIONS STAY MANAGED BY THE KEY."}
+              ? "ARMED — ENTRIES + EXITS SIGN SILENTLY AT FULL SPEED."
+              : "DISARMED — ORDERS FALL BACK TO PHANTOM, ONE PROMPT EACH."}
           </p>
           {armed && phantomOwnedOpen.length > 0 && (
             <p className="mt-1 text-[9px] leading-relaxed text-warn2">
-              {phantomOwnedOpen.length} OPEN POSITION{phantomOwnedOpen.length > 1 ? "S" : ""} BELONG
-              {phantomOwnedOpen.length > 1 ? "" : "S"} TO THE MAIN WALLET — KEEP PHANTOM CONNECTED ON
-              POLYGON SO THEIR TP/SL EXITS CAN STILL SIGN (THOSE WILL PROMPT).
+              {phantomOwnedOpen.length} POSITION{phantomOwnedOpen.length > 1 ? "S" : ""} ON THE MAIN
+              WALLET — KEEP PHANTOM CONNECTED (POLYGON) FOR THEIR EXITS.
             </p>
           )}
           <button

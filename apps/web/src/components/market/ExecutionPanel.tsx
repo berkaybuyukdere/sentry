@@ -174,6 +174,9 @@ export function ExecutionPanel() {
           : (limitPrice ?? est.price);
       const snapped = snapToTick(price, tick);
       const requestedShares = Math.floor((side === "BUY" ? usd / snapped : usd) * 100) / 100;
+      // small market BUYs fill all-or-nothing: a partial fill under the
+      // CLOB's $1 minimum is an instant dust position no order can exit
+      const marketType = side === "BUY" && usd <= 10 ? "FOK" : "FAK";
       const res = await signAndPlaceOrder(walletClient, address, {
         tokenId,
         side,
@@ -181,7 +184,7 @@ export function ExecutionPanel() {
         shares: requestedShares,
         tickSize: tick,
         negRisk: market.negRisk,
-        orderType: orderMode === "MARKET" ? "FAK" : "GTC",
+        orderType: orderMode === "MARKET" ? marketType : "GTC",
       });
       setResult(res);
       // ledger the CONFIRMED fill, not the pre-trade request — a market FAK
@@ -226,7 +229,7 @@ export function ExecutionPanel() {
         price: filledShares > 0 ? filledUsd / filledShares : snapped,
         shares: filledShares,
         usd: filledUsd,
-        orderType: orderMode === "MARKET" ? "FAK" : "GTC",
+        orderType: orderMode === "MARKET" ? marketType : "GTC",
         clobOrderId: res.orderID ?? null,
         txHash: res.transactionsHashes?.[0] ?? null,
         status: res.status ?? (res.success ? "SUBMITTED" : "REJECTED"),
