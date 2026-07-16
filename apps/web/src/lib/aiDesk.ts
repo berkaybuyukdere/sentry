@@ -691,17 +691,30 @@ export const useAiDesk = create<DeskState>()(
 );
 
 /** FREE-WILL derivation: everything scales from live equity so the same desk
- *  is sane at $500 and at $50,000. Clips 0.2–2% of equity, tempo exits,
- *  loss brake 10% of starting capital. The operator's target is respected. */
+ *  is sane at $30 and at $50,000. Clips 0.2–10% of equity, tempo exits,
+ *  loss brake 10% of starting capital. The operator's target is respected.
+ *
+ *  A prior version floored BOTH minTradeUsd and maxTradeUsd at fixed dollar
+ *  amounts ($2 / $4) that only mattered once equity crossed ~$1,000 below
+ *  that, every clip collapsed onto the SAME $2–4 band regardless of equity
+ *  or conviction — the real Kelly-derived size (which already scales with
+ *  edge strength via netEv/a and any copy-trade boost) was being computed
+ *  correctly and then thrown away by the floor and whole-dollar rounding.
+ *  The only floor that should never move is the CLOB's own minimum notional
+ *  (~$1.05 with fee/slippage padding); above that, size differentiation is
+ *  real and equity- and conviction-scaled, not a fixed narrow band. */
 export function effectiveDeskConfig(cfg: DeskConfig, equity: number, startingCapital: number): DeskConfig {
   if (!cfg.freeWill) return cfg;
   const T = TEMPO_PARAMS[cfg.tempo];
   const eq = Math.max(equity, 10);
-  const minTrade = Math.max(2, Math.round(eq * 0.002)); // $1 clips sit right at the CLOB minimum after client-side fee/slippage shave
+  const CLOB_MIN = 1.05; // exchange rejects sub-$1 notionals; padded for fee/slippage shave
+  const minTrade = Math.max(CLOB_MIN, eq * 0.002);
   return {
     ...cfg,
     minTradeUsd: minTrade,
-    maxTradeUsd: Math.max(minTrade * 2, Math.round(Math.min(eq * 0.03, 2500))),
+    // up to 10% of equity for the single highest-conviction clip — a real
+    // ceiling that grows with the account, not a fixed multiple of the floor
+    maxTradeUsd: Math.max(minTrade * 3, Math.min(eq * 0.10, 2500)),
     maxPositions: T.defaultMaxPositions,
     takeProfitPct: T.tpPct,
     stopLossPct: T.slPct,
@@ -1021,9 +1034,14 @@ export function sweepUniverse(
     const slFrac = cfg.stopLossPct / 100;
 
     // --- Kelly-lite sizing ---------------------------------------------------
+    // conviction already varies rawSize continuously via netEv/a (edge size)
+    // and R.kellyFraction — copy trades and high-alpha setups produce a
+    // genuinely bigger kelly fraction than marginal EV+ ones. Rounding to the
+    // nearest DIME (not whole dollar) preserves that differentiation instead
+    // of collapsing every small-account clip onto the same 2/3/4 buckets.
     const kelly = Math.max(0, (netEv / a) * R.kellyFraction);
     const rawSize = Math.min(kelly, 0.08) * equityUsd;
-    const sizeUsd = Math.round(Math.min(Math.max(rawSize, cfg.minTradeUsd), cfg.maxTradeUsd));
+    const sizeUsd = Math.round(Math.min(Math.max(rawSize, cfg.minTradeUsd), cfg.maxTradeUsd) * 10) / 10;
 
     const evPerHourUsd = (netEv / r.price) * sizeUsd / Math.max(expHoldMin / 60, 0.05);
 

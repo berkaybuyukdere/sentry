@@ -766,7 +766,7 @@ function Desk() {
                 </div>
                 <div className="grid grid-cols-2 gap-x-3 gap-y-1 font-mono text-[10px] tabular-nums text-dim">
                   <span className="text-faint">CLIP SIZE</span>
-                  <span className="text-right">${eff.minTradeUsd}–${eff.maxTradeUsd}</span>
+                  <span className="text-right">${eff.minTradeUsd.toFixed(2)}–${eff.maxTradeUsd.toFixed(2)}</span>
                   <span className="text-faint">MAX POSITIONS</span>
                   <span className="text-right">{eff.maxPositions}</span>
                   <span className="text-faint">MAX HOLD</span>
